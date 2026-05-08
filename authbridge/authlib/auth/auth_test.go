@@ -113,6 +113,64 @@ func TestHandleInbound_NoVerifier_Denies(t *testing.T) {
 	}
 }
 
+// DenyReasonCode must be populated on every ActionDeny InboundResult. The
+// listener/plugin layer uses the code (not the free-form DenyReason string)
+// to populate SessionEvent.Auth.Inbound[].Reason for machine-stable
+// filtering. A drift here would silently leave the event field empty on
+// denied requests.
+func TestHandleInbound_PopulatesDenyReasonCode(t *testing.T) {
+	cases := []struct {
+		name       string
+		cfg        Config
+		authHeader string
+		audience   string
+		want       InboundDenialReason
+	}{
+		{
+			name:       "no header",
+			cfg:        Config{Verifier: &mockVerifier{}},
+			authHeader: "",
+			want:       DENY_NO_HEADER,
+		},
+		{
+			name:       "malformed header",
+			cfg:        Config{Verifier: &mockVerifier{}},
+			authHeader: "Basic abc",
+			want:       DENY_MALFORMED_HEADER,
+		},
+		{
+			name:       "validator missing",
+			cfg:        Config{}, // nil Verifier
+			authHeader: "Bearer tok",
+			want:       DENY_VALIDATOR_MISSING,
+		},
+		{
+			name: "jwt failed",
+			cfg: Config{
+				Verifier: &mockVerifier{err: fmt.Errorf("bad signature")},
+				Identity: IdentityConfig{Audience: "aud"},
+			},
+			authHeader: "Bearer tok",
+			want:       DENY_JWT_FAILED,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := New(tc.cfg)
+			res := a.HandleInbound(context.Background(), tc.authHeader, "/api", tc.audience)
+			if res.Action != ActionDeny {
+				t.Fatalf("expected deny, got %q", res.Action)
+			}
+			if res.DenyReasonCode != tc.want {
+				t.Errorf("DenyReasonCode = %v, want %v", res.DenyReasonCode, tc.want)
+			}
+			if res.DenyReason == "" {
+				t.Error("DenyReason (human string) should still be populated alongside code")
+			}
+		})
+	}
+}
+
 func TestHandleInbound_AudienceOverride(t *testing.T) {
 	mv := &mockVerifier{claims: validClaims()}
 	a := New(Config{
