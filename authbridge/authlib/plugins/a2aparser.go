@@ -26,26 +26,19 @@ func (p *A2AParser) Capabilities() pipeline.PluginCapabilities {
 }
 
 func (p *A2AParser) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.Action {
+	// No Invocation recorded when the parser doesn't apply to this
+	// message (empty body, non-JSON-RPC body) — otherwise every
+	// unrelated HTTP call through the pipeline would show an "a2a-parser
+	// skip" row in abctl, which is noise. Operators infer "a2a-parser
+	// exists in this pipeline" from the pipeline config, not per-event.
 	if len(pctx.Body) == 0 {
 		slog.Debug("a2a-parser: no body, skipping")
-		appendInvocationInbound(pctx, pipeline.Invocation{
-			Plugin: "a2a-parser",
-			Action: pipeline.ActionSkip,
-			Reason: "no_body",
-			Path:   pctx.Path,
-		})
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 
 	var rpc jsonRPCRequest
 	if err := json.Unmarshal(pctx.Body, &rpc); err != nil {
 		slog.Debug("a2a-parser: invalid JSON-RPC", "error", err, "bodyLen", len(pctx.Body))
-		appendInvocationInbound(pctx, pipeline.Invocation{
-			Plugin: "a2a-parser",
-			Action: pipeline.ActionSkip,
-			Reason: "invalid_json_rpc",
-			Path:   pctx.Path,
-		})
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 
@@ -89,6 +82,7 @@ func (p *A2AParser) OnRequest(_ context.Context, pctx *pipeline.Context) pipelin
 	}
 	appendInvocationInbound(pctx, pipeline.Invocation{
 		Plugin: "a2a-parser",
+		Phase:  pipeline.InvocationPhaseRequest,
 		Action: pipeline.ActionObserve,
 		Reason: "matched_" + rpc.Method,
 		Path:   pctx.Path,
@@ -102,13 +96,10 @@ func (p *A2AParser) OnRequest(_ context.Context, pctx *pipeline.Context) pipelin
 //
 // Handles both JSON-RPC responses (message/send) and SSE event streams (message/stream).
 func (p *A2AParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeline.Action {
+	// No Invocation on response when the parser doesn't apply: either
+	// there's no response body or the matching request wasn't an A2A
+	// JSON-RPC call. Keeps the response event clean for non-A2A traffic.
 	if len(pctx.ResponseBody) == 0 || pctx.Extensions.A2A == nil {
-		appendInvocationInbound(pctx, pipeline.Invocation{
-			Plugin: "a2a-parser",
-			Action: pipeline.ActionSkip,
-			Reason: "no_response_body_or_request_not_parsed",
-			Path:   pctx.Path,
-		})
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 
@@ -136,6 +127,7 @@ func (p *A2AParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeli
 	)
 	appendInvocationInbound(pctx, pipeline.Invocation{
 		Plugin: "a2a-parser",
+		Phase:  pipeline.InvocationPhaseResponse,
 		Action: pipeline.ActionObserve,
 		Reason: "matched_" + pctx.Extensions.A2A.Method + "_response",
 		Path:   pctx.Path,

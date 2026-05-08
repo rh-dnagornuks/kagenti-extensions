@@ -26,36 +26,23 @@ func (p *InferenceParser) Capabilities() pipeline.PluginCapabilities {
 }
 
 func (p *InferenceParser) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.Action {
+	// No Invocation recorded when the parser doesn't apply to this
+	// message — wrong path (anything other than OpenAI chat/completion
+	// endpoints), empty body, or non-JSON body. Operators infer
+	// "inference-parser exists in this pipeline" from config, not per-
+	// event rows.
 	if pctx.Path != "/v1/chat/completions" && pctx.Path != "/v1/completions" {
-		appendInvocationOutbound(pctx, pipeline.Invocation{
-			Plugin: "inference-parser",
-			Action: pipeline.ActionSkip,
-			Reason: "wrong_path",
-			Path:   pctx.Path,
-		})
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 
 	if len(pctx.Body) == 0 {
 		slog.Debug("inference-parser: no body, skipping")
-		appendInvocationOutbound(pctx, pipeline.Invocation{
-			Plugin: "inference-parser",
-			Action: pipeline.ActionSkip,
-			Reason: "no_body",
-			Path:   pctx.Path,
-		})
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 
 	var req inferenceRequest
 	if err := json.Unmarshal(pctx.Body, &req); err != nil {
 		slog.Debug("inference-parser: invalid JSON", "error", err)
-		appendInvocationOutbound(pctx, pipeline.Invocation{
-			Plugin: "inference-parser",
-			Action: pipeline.ActionSkip,
-			Reason: "invalid_json",
-			Path:   pctx.Path,
-		})
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 
@@ -96,6 +83,7 @@ func (p *InferenceParser) OnRequest(_ context.Context, pctx *pipeline.Context) p
 
 	appendInvocationOutbound(pctx, pipeline.Invocation{
 		Plugin: "inference-parser",
+		Phase:  pipeline.InvocationPhaseRequest,
 		Action: pipeline.ActionObserve,
 		Reason: "matched_" + ext.Model,
 		Path:   pctx.Path,
@@ -107,13 +95,9 @@ func (p *InferenceParser) OnRequest(_ context.Context, pctx *pipeline.Context) p
 // token counts) on pctx.Extensions.Inference. Handles both non-streaming
 // JSON responses and SSE streams from OpenAI-compatible servers.
 func (p *InferenceParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeline.Action {
+	// No Invocation when the parser doesn't apply — request wasn't
+	// inference or no response body to parse.
 	if len(pctx.ResponseBody) == 0 || pctx.Extensions.Inference == nil {
-		appendInvocationOutbound(pctx, pipeline.Invocation{
-			Plugin: "inference-parser",
-			Action: pipeline.ActionSkip,
-			Reason: "no_response_body_or_request_not_parsed",
-			Path:   pctx.Path,
-		})
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 
@@ -133,6 +117,7 @@ func (p *InferenceParser) OnResponse(_ context.Context, pctx *pipeline.Context) 
 	slog.Debug("inference-parser: completion", "text", truncate(ext.Completion, debugBodyMax))
 	appendInvocationOutbound(pctx, pipeline.Invocation{
 		Plugin: "inference-parser",
+		Phase:  pipeline.InvocationPhaseResponse,
 		Action: pipeline.ActionObserve,
 		Reason: "matched_" + ext.Model + "_response",
 		Path:   pctx.Path,
