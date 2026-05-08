@@ -274,32 +274,74 @@ authentication isn't happening.
 
 ## Emitting session events
 
-Plugins can surface per-request state into `/v1/sessions` two ways.
-Pick based on how many other plugins want to consume the same shape.
+Every plugin MUST emit at least one `Invocation` record per
+`OnRequest` / `OnResponse` call. Plugins may also populate one of the
+typed protocol extensions (`MCP`, `A2A`, `Inference`) when they carry
+structured semantic payload, and may additionally publish arbitrary
+plugin-specific events through the `Custom` escape-hatch map.
 
-### Named category (typed slot)
+### 1. Invocation record (required for every plugin)
 
-`MCP`, `A2A`, `Inference`, `Auth` are named fields on
-`pipeline.Extensions`. Plugins write a typed struct into the relevant
-slot; the listener snapshots it onto `SessionEvent` on the wire.
-Consumers (abctl, dashboards, stats) know the exact schema at compile
-time.
+An `Invocation` says *which* plugin ran and *what* it did, in a
+5-value vocabulary shared across all plugins. abctl renders one row
+per invocation — without an invocation record, a plugin's work is
+invisible to the operator.
 
-Use a named category when:
+```go
+// Append one record per OnRequest/OnResponse call. Helper functions
+// exist in each plugin package; the listener snapshot will pick them up
+// from pctx.Extensions.Invocations.
+pctx.Extensions.Invocations = &pipeline.Invocations{
+    Inbound: []pipeline.Invocation{{
+        Plugin: "jwt-validation",
+        Action: pipeline.ActionAllow,    // 5-value verb
+        Reason: "authorized",             // machine-stable reason code
+        Path:   pctx.Path,
+    }},
+}
+```
 
-- **Multiple plugins produce the same shape.** Auth is shared by
-  `jwt-validation` (inbound) and `token-exchange` (outbound); a future
-  `token-broker` drops into the same slot without schema churn.
-- **abctl or dashboards need to render a dedicated column / panel.**
-- **Stats counters partition on the data** — category fields are
-  compile-checked, so a typo in a reason code fails the build.
+The 5 actions and when to use them:
 
-Adding a new named category is a **core-library change**: edit
-`pipeline/extensions.go` (new field), `pipeline/session.go` (wire + JSON
-round-trip), the listener (snapshot helper + recorder inclusion), and
-abctl if you want bespoke rendering.
+| Action | Meaning | Example |
+|---|---|---|
+| `allow` | Gate plugin permitted the request | jwt-validation on valid token |
+| `deny` | Gate plugin rejected the request; pipeline stops | jwt-validation on bad token, token-exchange on IdP failure |
+| `skip` | Plugin ran but didn't act on this message | jwt-validation on a bypass path; parser whose body didn't match |
+| `modify` | Plugin mutated the message | token-exchange replaced the Authorization header |
+| `observe` | Plugin attached diagnostic data; flow unchanged | parsers extracting MCP / A2A / Inference state |
 
-### Escape-hatch map (`Custom` with `/event` suffix)
+`Reason` is a stable machine-readable label (e.g. `path_bypass`,
+`no_matching_route`, `jwt_failed`, `matched_tools/call`) that
+discriminates within an Action value. Filters in abctl can match on
+either — `/skip` shows every skip action regardless of reason;
+`/path_bypass` narrows to that specific skip flavour.
+
+Fields populated selectively: auth gates fill `ExpectedIssuer` /
+`ExpectedAudience` / `Token*`; outbound routers fill `Route*` and
+`CacheHit`; parsers typically fill only `Plugin` / `Action` /
+`Reason` / `Path` because their semantic payload lives on the typed
+extension slot.
+
+NEVER put raw tokens, signatures, or secrets in an `Invocation`. The
+session store has no auth.
+
+### 2. Named protocol extension (optional, for parsers)
+
+`MCP`, `A2A`, `Inference` are typed slots on `pipeline.Extensions`.
+A parser that successfully extracts structured state populates the
+matching slot AND emits an `Invocation` with `ActionObserve`. The
+slot carries the parsed payload; the Invocation carries the
+attribution.
+
+Adding a new named extension is a core-library change: edit
+`pipeline/extensions.go`, `pipeline/session.go` (wire + JSON round-
+trip), the listener (snapshot + recorder), and abctl if you want
+bespoke rendering. Most new plugins don't need one — they emit an
+Invocation and publish extra context through the Custom map
+(below).
+
+### 3. Escape-hatch map (`Custom` with `/event` suffix)
 
 For plugin-specific observability that doesn't warrant a category yet,
 write to `pctx.Extensions.Custom` with a key ending in

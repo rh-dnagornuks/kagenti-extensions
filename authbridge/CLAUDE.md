@@ -339,13 +339,27 @@ Every event on `/v1/sessions/{id}` and `/v1/events` carries:
 
 - `at`, `direction`, `phase` — when, which side, what stage. `phase` is one of `"request"`, `"response"`, or `"denied"` (terminal denial from a pipeline plugin — typically a jwt-validation failure).
 - `a2a` / `mcp` / `inference` — protocol parser payloads (one at most).
-- `auth` — auth-class plugin decisions (`jwt-validation`, `token-exchange`, future plugins). Structured as `{inbound: [...], outbound: [...]}`; each entry carries the plugin name, decision/action (`allow` / `deny` / `bypass` / `exchange` / `denied`), a machine-stable reason code, and context (expected issuer, target audience, cache-hit flag).
+- `invocations` — per-plugin invocation records for every plugin that ran on the pipeline pass. Structured as `{inbound: [...], outbound: [...]}`; each entry carries `plugin`, `action` (one of 5 values — see below), `reason` (machine-stable code), and optional plugin-specific context (expected issuer, target audience, cache-hit flag, path, etc.). abctl renders one row per invocation, so operators see an explicit per-plugin timeline.
 - `plugins` — escape-hatch map for plugin-specific observability. Keys are plugin names; values are the raw JSON each plugin emitted. Unknown plugins render as opaque JSON in abctl. See `authlib/plugins/CONVENTIONS.md` "Emitting session events" for the producer contract.
 - `identity`, `host`, `statusCode`, `error`, `durationMs` — request-level context.
 
+### Invocation action vocabulary
+
+Every plugin emits one of these 5 action values per invocation, so operators can scan a timeline without memorizing plugin-specific verbs:
+
+| `action` | Meaning | Example |
+|---|---|---|
+| `allow` | Gate plugin permitted the request | jwt-validation on valid token |
+| `deny` | Gate plugin rejected the request; pipeline stops | jwt-validation on bad token, token-exchange on IdP failure |
+| `skip` | Plugin ran but didn't act on this message | jwt-validation on a bypass path; parser whose body didn't match |
+| `modify` | Plugin mutated the message | token-exchange replaced the Authorization header |
+| `observe` | Plugin attached diagnostic data without changing flow | a2a-parser, mcp-parser, inference-parser when they match |
+
+Use `reason` to discriminate within an action — e.g. `skip/path_bypass` vs `skip/no_matching_route` tell different stories at the detail-pane level but both scan as "skip" in the at-a-glance timeline.
+
 ### Gotcha: denied requests
 
-Pre-Auth-extension, rejected requests (401 / 503) were invisible in `/v1/sessions` because the listener recorded on protocol-parser match. After: any pipeline plugin that populates `pctx.Extensions.Auth` before rejecting produces a `phase: "denied"` event. If you're debugging an unauthorized-access pattern, the default-session bucket (`GET /v1/sessions/default`) is where denial events aggregate.
+Rejected requests (401 / 503) land as `phase: "denied"` events in `/v1/sessions` when at least one pipeline plugin appended an Invocation before rejecting. If you're debugging an unauthorized-access pattern, the default-session bucket (`GET /v1/sessions/default`) is where denial events aggregate.
 
 ### Disabling
 
