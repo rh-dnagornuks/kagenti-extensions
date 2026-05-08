@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/table"
@@ -16,6 +17,7 @@ import (
 func newEventsTable() table.Model {
 	t := table.New(
 		table.WithColumns([]table.Column{
+			{Title: "#", Width: 4},
 			{Title: "TIME", Width: 12},
 			{Title: "DIR", Width: 4},
 			{Title: "PHASE", Width: 6},
@@ -69,33 +71,66 @@ func (m *model) rebuildEventsTable() {
 	// response side, independent of other plugins in the same pipeline.
 	pairs := pairInvocationRows(rowSpecs)
 
+	// Event-level pair IDs for the # column. Assigns each event a small
+	// integer; events that match as a (request, response) pair share one
+	// integer so the operator can scan the column for the repeated
+	// number. Derived from the same row-level pair map that drives the
+	// └resp glyph, so the two visual cues stay consistent.
+	eventIDs := computeEventPairIDs(rowSpecs, pairs)
+
 	rows := make([]table.Row, 0, len(rowSpecs))
 	m.visibleRows = m.visibleRows[:0]
+	var lastEvent *pipeline.SessionEvent // most-recent event already rendered (post-filter)
 	for i, rs := range rowSpecs {
 		if m.filter != "" && !matchInvocationRow(rs, m.filter) {
 			continue
 		}
-		phase := shortPhase(rs.event.Phase)
-		if rs.event.Phase == pipeline.SessionResponse {
-			if _, paired := pairs[i]; paired {
-				// └ prefix visually connects the response row to its
-				// request row in the same (direction, plugin) pair.
-				phase = "└" + phase
+		// A "continuation" row is one whose event is the same as the
+		// previous RENDERED row's event (filtering-aware). We blank the
+		// event-level columns (#, TIME, DIR, PHASE, STATUS, DURATION,
+		// TOKENS, HOST) on continuation rows so an event's multi-plugin
+		// group reads as one visual block — only PLUGIN and ACTION vary.
+		// METHOD stays populated since a multi-plugin row set can still
+		// show per-plugin method context (e.g. a2a-parser observes
+		// message/stream while jwt-validation has no method at all).
+		continuation := lastEvent == rs.event
+
+		var idCell, timeCell, dirCell, phaseCell, statusC, durCell, tokC, hostC string
+		if !continuation {
+			if id, ok := eventIDs[rs.event]; ok {
+				idCell = strconv.Itoa(id)
 			}
+			timeCell = rs.event.At.Format("15:04:05.00")
+			dirCell = shortDirection(rs.event.Direction)
+			phaseCell = shortPhase(rs.event.Phase)
+			if rs.event.Phase == pipeline.SessionResponse {
+				if _, paired := pairs[i]; paired {
+					// └ prefix visually connects the response row to its
+					// request row in the same (direction, plugin) pair.
+					phaseCell = "└" + phaseCell
+				}
+			}
+			statusC = statusCell(*rs.event)
+			durCell = durationCell(*rs.event)
+			tokC = tokensCell(*rs.event)
+			hostC = truncStr(rs.event.Host, 20)
 		}
+
 		rows = append(rows, table.Row{
-			rs.event.At.Format("15:04:05.00"),
-			shortDirection(rs.event.Direction),
-			phase,
+			idCell,
+			timeCell,
+			dirCell,
+			phaseCell,
 			rs.actionCell(),
 			truncStr(rs.pluginCell(), 18),
 			eventMethod(*rs.event),
-			statusCell(*rs.event),
-			durationCell(*rs.event),
-			tokensCell(*rs.event),
-			truncStr(rs.event.Host, 20),
+			statusC,
+			durCell,
+			tokC,
+			hostC,
 		})
 		m.visibleRows = append(m.visibleRows, rs)
+		lastEvent = rs.event
 	}
 	m.eventsTbl.SetRows(rows)
 
@@ -256,6 +291,117 @@ func truncStr(s string, n int) string {
 	return s[:n-1] + "…"
 }
 
+// computeEventPairIDs assigns a small integer to every SessionEvent,
+// sharing one integer across a (request, response) pair and minting a new
+// one for unpaired events. The pairing decision is delegated to the row-
+// level pair map from pairInvocationRows — if any plugin row on event A
+// pairs with a plugin row on event B, then A and B pair at the event
+// level too. This keeps the # column's IDs consistent with the `└resp`
+// glyph the operator already sees (both derive from the same plugin-
+// level (direction, plugin) match).
+//
+// Deriving from pairInvocationRows rather than recomputing by
+// direction+host+method avoids a class of bugs with "featureless"
+// requests (no parser matched, so method is empty): multiple concurrent
+// passthrough calls to the same host all share the same host+method
+// key and a naive matcher claims the wrong response.
+//
+// IDs are keyed by event pointer so render loops can look up a row's ID
+// without knowing the slice index. IDs start at 1 and increment in
+// first-seen row order so adjacent pairs get adjacent integers.
+func computeEventPairIDs(rowSpecs []invocationRow, pairs map[int]int) map[*pipeline.SessionEvent]int {
+	// Derive event-level pairs from row-level pairs. pairs is symmetric
+	// (pairs[i]=j and pairs[j]=i), so iterating either entry sets the
+	// map symmetrically. Last-write-wins when a single event pairs
+	// through multiple plugins, but in practice all plugin rows on one
+	// request event point at the same response event.
+	eventPair := make(map[*pipeline.SessionEvent]*pipeline.SessionEvent)
+	for i, j := range pairs {
+		ei, ej := rowSpecs[i].event, rowSpecs[j].event
+		if ei != ej {
+			eventPair[ei] = ej
+		}
+	}
+
+	// Event-level fallback for pairs the row-level matcher can't see.
+	// When a response event has no plugin invocations (e.g. a bypass
+	// path like /.well-known/agent.json — jwt-validation skipped on the
+	// request and no parser matched on the response), its pseudo-row
+	// has no (direction, plugin) key and pairInvocationRows leaves it
+	// unpaired. Scan the ordered event list and link each unpaired
+	// response to the closest preceding unpaired request with matching
+	// direction + host so the # column still reflects the pairing.
+	//
+	// Closest-preceding match is sufficient for bypass traffic where
+	// the response event immediately follows its request in the slice.
+	// Multiple concurrent bypass requests on the same host could
+	// theoretically cross-pair, but that's a near-simultaneous
+	// duplicate-path pattern we don't expect in real traffic.
+	orderedEvents := orderedUniqueEvents(rowSpecs)
+	for i, e := range orderedEvents {
+		if e.Phase != pipeline.SessionResponse {
+			continue
+		}
+		if _, paired := eventPair[e]; paired {
+			continue
+		}
+		for j := i - 1; j >= 0; j-- {
+			prev := orderedEvents[j]
+			if prev.Phase != pipeline.SessionRequest {
+				continue
+			}
+			if _, already := eventPair[prev]; already {
+				continue
+			}
+			if prev.Direction != e.Direction || prev.Host != e.Host {
+				continue
+			}
+			eventPair[e] = prev
+			eventPair[prev] = e
+			break
+		}
+	}
+
+	ids := make(map[*pipeline.SessionEvent]int)
+	seen := make(map[*pipeline.SessionEvent]bool)
+	next := 0
+	for _, rs := range rowSpecs {
+		e := rs.event
+		if seen[e] {
+			continue
+		}
+		seen[e] = true
+		// If this event's paired partner has already been assigned an
+		// ID (partner appeared earlier in row order), reuse it.
+		if partner := eventPair[e]; partner != nil {
+			if pid, ok := ids[partner]; ok {
+				ids[e] = pid
+				continue
+			}
+		}
+		next++
+		ids[e] = next
+	}
+	return ids
+}
+
+// orderedUniqueEvents returns distinct event pointers in the order they
+// first appear in rowSpecs. Used by computeEventPairIDs' event-level
+// fallback to walk events sequentially while looking backward for
+// unpaired request counterparts.
+func orderedUniqueEvents(rowSpecs []invocationRow) []*pipeline.SessionEvent {
+	seen := make(map[*pipeline.SessionEvent]bool, len(rowSpecs))
+	out := make([]*pipeline.SessionEvent, 0, len(rowSpecs))
+	for _, rs := range rowSpecs {
+		if seen[rs.event] {
+			continue
+		}
+		seen[rs.event] = true
+		out = append(out, rs.event)
+	}
+	return out
+}
+
 // matchInvocationRow does a case-insensitive substring match across every
 // string field the operator might reasonably search for — the invocation's
 // own fields plus the containing event's protocol extensions. Two prefix
@@ -327,11 +473,21 @@ func matchInvocationRow(r invocationRow, q string) bool {
 // and hasn't been claimed.
 func pairInvocationRows(rows []invocationRow) map[int]int {
 	pairs := make(map[int]int)
+	// Pair key includes plugin + direction + method (from whichever
+	// parser extension is populated). Without the method component,
+	// a fire-and-forget request like MCP's notifications/initialized
+	// would greedily claim the NEXT mcp-parser response — typically
+	// the response to tools/list — and orphan the actual tools/list
+	// request from its own response. Method discrimination makes the
+	// match specific: mcp-parser/out/tools/list only pairs with
+	// mcp-parser/out/tools/list. Auth plugins have no method; empty
+	// methods still pair with empty methods (same key), preserving
+	// pair behaviour for token-exchange and jwt-validation rows.
 	key := func(r invocationRow) (string, pipeline.Direction, bool) {
 		if r.inv == nil {
 			return "", r.direction, false
 		}
-		return r.inv.Plugin, r.direction, true
+		return r.inv.Plugin + "|" + eventMethod(*r.event), r.direction, true
 	}
 	for i := range rows {
 		if rows[i].event.Phase != pipeline.SessionRequest {
@@ -340,7 +496,7 @@ func pairInvocationRows(rows []invocationRow) map[int]int {
 		if _, already := pairs[i]; already {
 			continue
 		}
-		plug, dir, ok := key(rows[i])
+		k, dir, ok := key(rows[i])
 		if !ok {
 			continue
 		}
@@ -351,8 +507,8 @@ func pairInvocationRows(rows []invocationRow) map[int]int {
 			if _, taken := pairs[j]; taken {
 				continue
 			}
-			rplug, rdir, rok := key(rows[j])
-			if !rok || rplug != plug || rdir != dir {
+			rk, rdir, rok := key(rows[j])
+			if !rok || rk != k || rdir != dir {
 				continue
 			}
 			pairs[i] = j

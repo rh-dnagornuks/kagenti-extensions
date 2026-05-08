@@ -217,6 +217,101 @@ func TestMatchInvocationRow_PluginPrefix(t *testing.T) {
 	}
 }
 
+// TestComputeEventPairIDs_BypassResponseWithEmptyInvocations locks the
+// event-level fallback pairing: when a response event has no plugin
+// invocations at all (e.g. jwt-validation bypass response), it should
+// still pair with its preceding request event via direction+host match
+// so the # column shows the same ID on both rows.
+func TestComputeEventPairIDs_BypassResponseWithEmptyInvocations(t *testing.T) {
+	events := []pipeline.SessionEvent{
+		// Event 0: bypass req — jwt-validation skip invocation
+		{
+			Direction: pipeline.Inbound,
+			Phase:     pipeline.SessionRequest,
+			Invocations: &pipeline.Invocations{Inbound: []pipeline.Invocation{{
+				Plugin: "jwt-validation",
+				Phase:  pipeline.InvocationPhaseRequest,
+				Action: pipeline.ActionSkip,
+			}}},
+		},
+		// Event 1: bypass resp — no invocations (response-phase filter returns empty)
+		{Direction: pipeline.Inbound, Phase: pipeline.SessionResponse, StatusCode: 200},
+		// Event 2: bypass req (different bypass path, same direction+host="")
+		{
+			Direction: pipeline.Inbound,
+			Phase:     pipeline.SessionRequest,
+			Invocations: &pipeline.Invocations{Inbound: []pipeline.Invocation{{
+				Plugin: "jwt-validation",
+				Phase:  pipeline.InvocationPhaseRequest,
+				Action: pipeline.ActionSkip,
+			}}},
+		},
+		// Event 3: bypass resp
+		{Direction: pipeline.Inbound, Phase: pipeline.SessionResponse, StatusCode: 200},
+	}
+
+	rows := flattenInvocations(events)
+	pairs := pairInvocationRows(rows)
+	ids := computeEventPairIDs(rows, pairs)
+
+	id0, id1 := ids[&events[0]], ids[&events[1]]
+	id2, id3 := ids[&events[2]], ids[&events[3]]
+
+	if id0 != id1 {
+		t.Errorf("bypass req/resp #1: got ids (%d,%d), want equal", id0, id1)
+	}
+	if id2 != id3 {
+		t.Errorf("bypass req/resp #2: got ids (%d,%d), want equal", id2, id3)
+	}
+	if id0 == id2 {
+		t.Errorf("different bypass pairs should have different ids, both got %d", id0)
+	}
+}
+
+// TestPairInvocationRows_MethodDiscrimination locks the method-aware
+// pairing. Fire-and-forget MCP methods (notifications/initialized) have
+// no response; a subsequent tools/list req+resp pair must not be
+// disrupted by the notification's mcp-parser row greedily claiming the
+// tools/list response row.
+func TestPairInvocationRows_MethodDiscrimination(t *testing.T) {
+	mk := func(phase pipeline.SessionPhase, method string) pipeline.SessionEvent {
+		return pipeline.SessionEvent{
+			Direction: pipeline.Outbound,
+			Phase:     phase,
+			MCP:       &pipeline.MCPExtension{Method: method},
+			Invocations: &pipeline.Invocations{Outbound: []pipeline.Invocation{{
+				Plugin: "mcp-parser",
+				Phase:  invocationPhaseFor(phase),
+				Action: pipeline.ActionObserve,
+			}}},
+		}
+	}
+	events := []pipeline.SessionEvent{
+		mk(pipeline.SessionRequest, "notifications/initialized"), // no resp (fire and forget)
+		mk(pipeline.SessionRequest, "tools/list"),
+		mk(pipeline.SessionResponse, "tools/list"),
+	}
+	rows := flattenInvocations(events)
+	pairs := pairInvocationRows(rows)
+	ids := computeEventPairIDs(rows, pairs)
+
+	if ids[&events[1]] != ids[&events[2]] {
+		t.Errorf("tools/list req and resp must share ID, got %d vs %d",
+			ids[&events[1]], ids[&events[2]])
+	}
+	if ids[&events[0]] == ids[&events[1]] {
+		t.Errorf("notifications/initialized (orphan) must not share ID with tools/list, both got %d",
+			ids[&events[0]])
+	}
+}
+
+func invocationPhaseFor(p pipeline.SessionPhase) pipeline.InvocationPhase {
+	if p == pipeline.SessionResponse {
+		return pipeline.InvocationPhaseResponse
+	}
+	return pipeline.InvocationPhaseRequest
+}
+
 // Build a realistic auth-only request/response pair and assert that the
 // flatten → pair pipeline connects them end-to-end. Regression-protects
 // the chart-default case (jwt-validation only, no parsers).
