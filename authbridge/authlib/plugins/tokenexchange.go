@@ -472,9 +472,9 @@ func (p *TokenExchange) OnRequest(ctx context.Context, pctx *pipeline.Context) p
 	// either tighten routes or filter on action=passthrough in abctl.
 	switch result.Action {
 	case auth.ActionDeny:
-		appendOutboundAuth(pctx, pipeline.OutboundAuth{
+		appendInvocationOutbound(pctx, pipeline.Invocation{
 			Plugin:          "token-exchange",
-			Action:          "denied",
+			Action:          pipeline.ActionDeny,
 			Reason:          result.DenyReasonCode.String(),
 			RouteMatched:    result.RouteMatched,
 			RouteHost:       host,
@@ -492,9 +492,14 @@ func (p *TokenExchange) OnRequest(ctx context.Context, pctx *pipeline.Context) p
 		return pipeline.DenyStatus(result.DenyStatus, code, result.DenyReason)
 	case auth.ActionReplaceToken:
 		pctx.Headers.Set("Authorization", "Bearer "+result.Token)
-		appendOutboundAuth(pctx, pipeline.OutboundAuth{
+		reason := "token_replaced"
+		if result.CacheHit {
+			reason = "cache_hit"
+		}
+		appendInvocationOutbound(pctx, pipeline.Invocation{
 			Plugin:          "token-exchange",
-			Action:          "exchange",
+			Action:          pipeline.ActionModify,
+			Reason:          reason,
 			RouteMatched:    true,
 			RouteHost:       host,
 			TargetAudience:  result.TargetAudience,
@@ -503,13 +508,17 @@ func (p *TokenExchange) OnRequest(ctx context.Context, pctx *pipeline.Context) p
 		})
 	default:
 		// ActionAllow / unroutable host / default-policy=passthrough all
-		// land here. Leave Reason empty — DenyReasonCode is the zero
-		// enum value on the allow branch and would render as the wrong
-		// code. RouteMatched distinguishes "had a passthrough route" (t)
-		// from "fell through to default_policy" (f).
-		appendOutboundAuth(pctx, pipeline.OutboundAuth{
+		// land here. Reason discriminates explicit-route-passthrough from
+		// no-route-match-default-policy; both render as "skip" in the
+		// 5-value vocab.
+		reason := "no_matching_route"
+		if result.RouteMatched {
+			reason = "route_passthrough"
+		}
+		appendInvocationOutbound(pctx, pipeline.Invocation{
 			Plugin:       "token-exchange",
-			Action:       "passthrough",
+			Action:       pipeline.ActionSkip,
+			Reason:       reason,
 			RouteMatched: result.RouteMatched,
 			RouteHost:    host,
 		})
@@ -517,14 +526,14 @@ func (p *TokenExchange) OnRequest(ctx context.Context, pctx *pipeline.Context) p
 	return pipeline.Action{Type: pipeline.Continue}
 }
 
-// appendOutboundAuth lazy-creates pctx.Extensions.Auth and appends one
-// entry under Outbound. Symmetric with appendInboundAuth in
-// jwtvalidation.go.
-func appendOutboundAuth(pctx *pipeline.Context, entry pipeline.OutboundAuth) {
-	if pctx.Extensions.Auth == nil {
-		pctx.Extensions.Auth = &pipeline.AuthExtension{}
+// appendInvocationOutbound lazy-creates pctx.Extensions.Invocations and
+// appends one entry under Outbound. Symmetric with appendInvocationInbound
+// in jwtvalidation.go.
+func appendInvocationOutbound(pctx *pipeline.Context, entry pipeline.Invocation) {
+	if pctx.Extensions.Invocations == nil {
+		pctx.Extensions.Invocations = &pipeline.Invocations{}
 	}
-	pctx.Extensions.Auth.Outbound = append(pctx.Extensions.Auth.Outbound, entry)
+	pctx.Extensions.Invocations.Outbound = append(pctx.Extensions.Invocations.Outbound, entry)
 }
 
 // splitScopes turns a space-separated scope string into []string. Returns

@@ -314,7 +314,7 @@ func TestJWTValidation_OnRequest_NotConfigured(t *testing.T) {
 // --- JWTValidation: Auth extension population ---
 //
 // These tests verify jwt-validation surfaces its decision on
-// pctx.Extensions.Auth.Inbound so the listener can record a
+// pctx.Extensions.Invocations.Inbound so the listener can record a
 // SessionEvent reflecting allow/deny/bypass. Plumbed through a
 // mockVerifier injected into p.inner (instead of spinning up a real
 // JWKS server) — keeps the test focused on plugin behavior, not crypto.
@@ -356,15 +356,15 @@ func TestJWTValidation_OnRequest_PopulatesAuth_Bypass(t *testing.T) {
 	if action.Type != pipeline.Continue {
 		t.Fatalf("bypass should Continue, got %v", action.Type)
 	}
-	if pctx.Extensions.Auth == nil || len(pctx.Extensions.Auth.Inbound) != 1 {
-		t.Fatalf("expected one Auth.Inbound entry, got %+v", pctx.Extensions.Auth)
+	if pctx.Extensions.Invocations == nil || len(pctx.Extensions.Invocations.Inbound) != 1 {
+		t.Fatalf("expected one Auth.Inbound entry, got %+v", pctx.Extensions.Invocations)
 	}
-	got := pctx.Extensions.Auth.Inbound[0]
+	got := pctx.Extensions.Invocations.Inbound[0]
 	if got.Plugin != "jwt-validation" {
 		t.Errorf("Plugin = %q, want jwt-validation", got.Plugin)
 	}
-	if got.Decision != "bypass" || got.Reason != "path_bypass" {
-		t.Errorf("got Decision=%q Reason=%q, want bypass/path_bypass", got.Decision, got.Reason)
+	if got.Action != pipeline.ActionSkip || got.Reason != "path_bypass" {
+		t.Errorf("got Action=%q Reason=%q, want skip/path_bypass", got.Action, got.Reason)
 	}
 }
 
@@ -380,12 +380,12 @@ func TestJWTValidation_OnRequest_PopulatesAuth_Deny_NoHeader(t *testing.T) {
 	if action.Type != pipeline.Reject {
 		t.Fatalf("expected Reject on missing auth header, got %v", action.Type)
 	}
-	if pctx.Extensions.Auth == nil || len(pctx.Extensions.Auth.Inbound) != 1 {
-		t.Fatalf("expected one Auth.Inbound entry, got %+v", pctx.Extensions.Auth)
+	if pctx.Extensions.Invocations == nil || len(pctx.Extensions.Invocations.Inbound) != 1 {
+		t.Fatalf("expected one Auth.Inbound entry, got %+v", pctx.Extensions.Invocations)
 	}
-	got := pctx.Extensions.Auth.Inbound[0]
-	if got.Decision != "deny" {
-		t.Errorf("Decision = %q, want deny", got.Decision)
+	got := pctx.Extensions.Invocations.Inbound[0]
+	if got.Action != pipeline.ActionDeny {
+		t.Errorf("Action = %q, want deny", got.Action)
 	}
 	// Reason comes from InboundDenialReason.String() so consumers can
 	// filter on a machine-stable code without parsing English.
@@ -417,12 +417,12 @@ func TestJWTValidation_OnRequest_PopulatesAuth_Allow(t *testing.T) {
 	if action.Type != pipeline.Continue {
 		t.Fatalf("expected Continue, got %v (violation=%+v)", action.Type, action.Violation)
 	}
-	if pctx.Extensions.Auth == nil || len(pctx.Extensions.Auth.Inbound) != 1 {
-		t.Fatalf("expected one Auth.Inbound entry, got %+v", pctx.Extensions.Auth)
+	if pctx.Extensions.Invocations == nil || len(pctx.Extensions.Invocations.Inbound) != 1 {
+		t.Fatalf("expected one Auth.Inbound entry, got %+v", pctx.Extensions.Invocations)
 	}
-	got := pctx.Extensions.Auth.Inbound[0]
-	if got.Decision != "allow" || got.Reason != "authorized" {
-		t.Errorf("got Decision=%q Reason=%q, want allow/authorized", got.Decision, got.Reason)
+	got := pctx.Extensions.Invocations.Inbound[0]
+	if got.Action != pipeline.ActionAllow || got.Reason != "authorized" {
+		t.Errorf("got Action=%q Reason=%q, want allow/authorized", got.Action, got.Reason)
 	}
 	if got.TokenSubject != "alice" {
 		t.Errorf("TokenSubject = %q, want alice", got.TokenSubject)
@@ -640,12 +640,12 @@ func TestTokenExchange_Passthrough(t *testing.T) {
 	// see every outbound host the pod talks to in the session stream.
 	// RouteHost carries the target so they can spot unexpected egress
 	// without hunting through slog lines.
-	if pctx.Extensions.Auth == nil || len(pctx.Extensions.Auth.Outbound) != 1 {
-		t.Fatalf("expected one Auth.Outbound entry, got %+v", pctx.Extensions.Auth)
+	if pctx.Extensions.Invocations == nil || len(pctx.Extensions.Invocations.Outbound) != 1 {
+		t.Fatalf("expected one Auth.Outbound entry, got %+v", pctx.Extensions.Invocations)
 	}
-	ob := pctx.Extensions.Auth.Outbound[0]
-	if ob.Plugin != "token-exchange" || ob.Action != "passthrough" {
-		t.Errorf("entry = (%q, %q), want (token-exchange, passthrough)", ob.Plugin, ob.Action)
+	ob := pctx.Extensions.Invocations.Outbound[0]
+	if ob.Plugin != "token-exchange" || ob.Action != pipeline.ActionSkip {
+		t.Errorf("entry = (%q, %q), want (token-exchange, skip)", ob.Plugin, ob.Action)
 	}
 	if ob.RouteHost != "some-host" {
 		t.Errorf("RouteHost = %q, want some-host", ob.RouteHost)
@@ -691,12 +691,12 @@ func TestTokenExchange_ExchangeSuccess(t *testing.T) {
 	// SessionEvent.Auth.Outbound once the listener records. Empty route
 	// (TargetAudience, RequestedScopes) is OK here — this test doesn't
 	// configure routes, it uses default_policy=exchange.
-	if pctx.Extensions.Auth == nil || len(pctx.Extensions.Auth.Outbound) != 1 {
-		t.Fatalf("expected one Auth.Outbound entry, got %+v", pctx.Extensions.Auth)
+	if pctx.Extensions.Invocations == nil || len(pctx.Extensions.Invocations.Outbound) != 1 {
+		t.Fatalf("expected one Auth.Outbound entry, got %+v", pctx.Extensions.Invocations)
 	}
-	got := pctx.Extensions.Auth.Outbound[0]
-	if got.Plugin != "token-exchange" || got.Action != "exchange" {
-		t.Errorf("got Plugin=%q Action=%q, want token-exchange/exchange", got.Plugin, got.Action)
+	got := pctx.Extensions.Invocations.Outbound[0]
+	if got.Plugin != "token-exchange" || got.Action != pipeline.ActionModify {
+		t.Errorf("got Plugin=%q Action=%q, want token-exchange/modify", got.Plugin, got.Action)
 	}
 	if got.RouteHost != "target-svc" {
 		t.Errorf("RouteHost = %q, want target-svc", got.RouteHost)
@@ -738,12 +738,12 @@ func TestTokenExchange_ExchangeFailure(t *testing.T) {
 	// Deny branch must surface a "denied" Auth.Outbound entry with the
 	// machine-stable reason — matches what the listener needs to emit a
 	// SessionDenied event on outbound exchange failure.
-	if pctx.Extensions.Auth == nil || len(pctx.Extensions.Auth.Outbound) != 1 {
-		t.Fatalf("expected one Auth.Outbound entry, got %+v", pctx.Extensions.Auth)
+	if pctx.Extensions.Invocations == nil || len(pctx.Extensions.Invocations.Outbound) != 1 {
+		t.Fatalf("expected one Auth.Outbound entry, got %+v", pctx.Extensions.Invocations)
 	}
-	got := pctx.Extensions.Auth.Outbound[0]
-	if got.Action != "denied" {
-		t.Errorf("Action = %q, want denied", got.Action)
+	got := pctx.Extensions.Invocations.Outbound[0]
+	if got.Action != pipeline.ActionDeny {
+		t.Errorf("Action = %q, want deny", got.Action)
 	}
 	if got.Reason != "token_exchange_failed" {
 		t.Errorf("Reason = %q, want token_exchange_failed (from OutboundDenialReason.String)", got.Reason)
