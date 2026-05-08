@@ -434,19 +434,20 @@ func scanUntilPrefix(t *testing.T, sc *bufio.Scanner, prefix string, d time.Dura
 	return ""
 }
 
-// TestHandleGet_SerializesAuthExtension verifies the wire shape of
-// SessionEvent.Auth on /v1/sessions/{id}. A downstream consumer (abctl,
-// curl pipes, scripts) must be able to decode the structured Inbound /
-// Outbound slices without a side channel — this locks the schema.
-func TestHandleGet_SerializesAuthExtension(t *testing.T) {
+// TestHandleGet_SerializesInvocations verifies the wire shape of
+// SessionEvent.Invocations on /v1/sessions/{id}. A downstream consumer
+// (abctl, curl pipes, scripts) must be able to decode the structured
+// Inbound / Outbound slices without a side channel — this locks the
+// schema, including the 5-value Action vocabulary.
+func TestHandleGet_SerializesInvocations(t *testing.T) {
 	ts, store := newTestServer(t)
-	store.Append("s-auth", pipeline.SessionEvent{
+	store.Append("s-inv", pipeline.SessionEvent{
 		Direction: pipeline.Inbound,
 		Phase:     pipeline.SessionDenied,
-		Auth: &pipeline.AuthExtension{
-			Inbound: []pipeline.InboundAuth{{
+		Invocations: &pipeline.Invocations{
+			Inbound: []pipeline.Invocation{{
 				Plugin:           "jwt-validation",
-				Decision:         "deny",
+				Action:           pipeline.ActionDeny,
 				Reason:           "jwt_failed",
 				ExpectedIssuer:   "http://issuer.example",
 				ExpectedAudience: "agent-aud",
@@ -454,7 +455,7 @@ func TestHandleGet_SerializesAuthExtension(t *testing.T) {
 		},
 	})
 
-	resp, err := http.Get(ts.URL + "/v1/sessions/s-auth")
+	resp, err := http.Get(ts.URL + "/v1/sessions/s-inv")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,9 +469,13 @@ func TestHandleGet_SerializesAuthExtension(t *testing.T) {
 	if !strings.Contains(string(body), `"phase":"denied"`) {
 		t.Errorf("missing denied phase in wire: %s", body)
 	}
-	// Auth sub-object present
-	if !strings.Contains(string(body), `"auth":`) {
-		t.Errorf("missing auth field in wire: %s", body)
+	// Invocations sub-object present; action rendered as the
+	// 5-value string, not the old "decision":"deny" shape.
+	if !strings.Contains(string(body), `"invocations":`) {
+		t.Errorf("missing invocations field in wire: %s", body)
+	}
+	if !strings.Contains(string(body), `"action":"deny"`) {
+		t.Errorf("missing action=deny in wire: %s", body)
 	}
 
 	// Structural decode — consumer can unmarshal straight into the
@@ -486,11 +491,15 @@ func TestHandleGet_SerializesAuthExtension(t *testing.T) {
 	if got.Phase != pipeline.SessionDenied {
 		t.Errorf("Phase = %v, want SessionDenied", got.Phase)
 	}
-	if got.Auth == nil || len(got.Auth.Inbound) != 1 {
-		t.Fatalf("Auth not decoded: %+v", got.Auth)
+	if got.Invocations == nil || len(got.Invocations.Inbound) != 1 {
+		t.Fatalf("Invocations not decoded: %+v", got.Invocations)
 	}
-	if got.Auth.Inbound[0].Reason != "jwt_failed" {
-		t.Errorf("Reason = %q, want jwt_failed", got.Auth.Inbound[0].Reason)
+	inv := got.Invocations.Inbound[0]
+	if inv.Action != pipeline.ActionDeny {
+		t.Errorf("Action = %q, want deny", inv.Action)
+	}
+	if inv.Reason != "jwt_failed" {
+		t.Errorf("Reason = %q, want jwt_failed", inv.Reason)
 	}
 }
 

@@ -715,11 +715,11 @@ func TestRecordInboundResponseSession_AuthOnly(t *testing.T) {
 
 	pctx := &pipeline.Context{
 		Extensions: pipeline.Extensions{
-			Auth: &pipeline.AuthExtension{
-				Inbound: []pipeline.InboundAuth{{
-					Plugin:   "jwt-validation",
-					Decision: "allow",
-					Reason:   "authorized",
+			Invocations: &pipeline.Invocations{
+				Inbound: []pipeline.Invocation{{
+					Plugin: "jwt-validation",
+					Action: pipeline.ActionAllow,
+					Reason: "authorized",
 				}},
 			},
 		},
@@ -735,8 +735,8 @@ func TestRecordInboundResponseSession_AuthOnly(t *testing.T) {
 	if e.Direction != pipeline.Inbound || e.Phase != pipeline.SessionResponse {
 		t.Errorf("event fields = (%v, %v), want (Inbound, SessionResponse)", e.Direction, e.Phase)
 	}
-	if e.Auth == nil || len(e.Auth.Inbound) != 1 || e.Auth.Inbound[0].Decision != "allow" {
-		t.Errorf("Auth extension not attached correctly: %+v", e.Auth)
+	if e.Invocations == nil || len(e.Invocations.Inbound) != 1 || e.Invocations.Inbound[0].Action != pipeline.ActionAllow {
+		t.Errorf("Invocations not attached correctly: %+v", e.Invocations)
 	}
 	if e.StatusCode != 200 {
 		t.Errorf("StatusCode = %d, want 200", e.StatusCode)
@@ -1147,11 +1147,11 @@ func TestRecordInboundSession_AuthOnly(t *testing.T) {
 
 	pctx := &pipeline.Context{
 		Extensions: pipeline.Extensions{
-			Auth: &pipeline.AuthExtension{
-				Inbound: []pipeline.InboundAuth{{
-					Plugin:   "jwt-validation",
-					Decision: "allow",
-					Reason:   "authorized",
+			Invocations: &pipeline.Invocations{
+				Inbound: []pipeline.Invocation{{
+					Plugin: "jwt-validation",
+					Action: pipeline.ActionAllow,
+					Reason: "authorized",
 				}},
 			},
 		},
@@ -1163,11 +1163,11 @@ func TestRecordInboundSession_AuthOnly(t *testing.T) {
 		t.Fatalf("expected 1 event under default session, got %v", v)
 	}
 	ev := v.Events[0]
-	if ev.Auth == nil || len(ev.Auth.Inbound) != 1 {
-		t.Fatalf("Auth.Inbound not snapshotted: %+v", ev.Auth)
+	if ev.Invocations == nil || len(ev.Invocations.Inbound) != 1 {
+		t.Fatalf("Invocations.Inbound not snapshotted: %+v", ev.Invocations)
 	}
-	if ev.Auth.Inbound[0].Decision != "allow" {
-		t.Errorf("Decision lost in snapshot: %+v", ev.Auth.Inbound[0])
+	if ev.Invocations.Inbound[0].Action != pipeline.ActionAllow {
+		t.Errorf("Action lost in snapshot: %+v", ev.Invocations.Inbound[0])
 	}
 }
 
@@ -1184,10 +1184,10 @@ func TestRecordInboundReject_EmitsDeniedPhase(t *testing.T) {
 	pctx := &pipeline.Context{
 		StartedAt: time.Now().Add(-10 * time.Millisecond),
 		Extensions: pipeline.Extensions{
-			Auth: &pipeline.AuthExtension{
-				Inbound: []pipeline.InboundAuth{{
+			Invocations: &pipeline.Invocations{
+				Inbound: []pipeline.Invocation{{
 					Plugin:           "jwt-validation",
-					Decision:         "deny",
+					Action:           pipeline.ActionDeny,
 					Reason:           "jwt_failed",
 					ExpectedIssuer:   "http://issuer.example",
 					ExpectedAudience: "agent-aud",
@@ -1212,8 +1212,8 @@ func TestRecordInboundReject_EmitsDeniedPhase(t *testing.T) {
 	if ev.Error == nil || ev.Error.Code != "auth.unauthorized" {
 		t.Errorf("Error = %+v, want code=auth.unauthorized", ev.Error)
 	}
-	if ev.Auth == nil || len(ev.Auth.Inbound) != 1 || ev.Auth.Inbound[0].Decision != "deny" {
-		t.Errorf("Auth context lost on denied event: %+v", ev.Auth)
+	if ev.Invocations == nil || len(ev.Invocations.Inbound) != 1 || ev.Invocations.Inbound[0].Action != pipeline.ActionDeny {
+		t.Errorf("Invocations context lost on denied event: %+v", ev.Invocations)
 	}
 	if ev.Duration <= 0 {
 		t.Errorf("Duration = %v, want > 0", ev.Duration)
