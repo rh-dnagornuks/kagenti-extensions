@@ -21,7 +21,7 @@ import (
 )
 
 // tokenExchangeConfig is the plugin's local config schema. See
-// authlib/plugins/CONVENTIONS.md for the pattern.
+// authbridge/docs/plugin-reference.md for the pattern.
 type tokenExchangeConfig struct {
 	// TokenURL is the OAuth token endpoint. Explicit value wins; else
 	// derived from KeycloakURL + KeycloakRealm using Keycloak's

@@ -5,10 +5,9 @@ contract — field names, invariants, error behaviour, the rules that the
 framework enforces at startup.
 
 **See also:**
-- [`GUIDE.md`](./GUIDE.md) — step-by-step tutorial for writing a new plugin.
-- [`../pipeline/README.md`](../pipeline/README.md) — framework architecture:
-  how the pipeline composes plugins, the lifecycle, the Context / Extensions
-  wire shape.
+- [`plugin-tutorial.md`](./plugin-tutorial.md) — step-by-step tutorial for writing a new plugin.
+- [`framework-architecture.md`](./framework-architecture.md) — how the pipeline
+  composes plugins, the lifecycle, the Context / Extensions wire shape.
 
 How plugins under `authbridge/authlib/plugins/` receive, validate, and
 apply their configuration; emit session events; and register themselves
@@ -293,7 +292,7 @@ specific events through the `Custom` escape-hatch map.
 
 > For a tutorial on emitting Invocations — the `pctx.Record` / `Allow`
 > / `Skip` / `Observe` / `Modify` / `DenyAndRecord` helpers with
-> runnable examples — see [`GUIDE.md` Step 2](./GUIDE.md#step-2--record-what-your-plugin-did).
+> runnable examples — see [`plugin-tutorial.md` Step 2](./plugin-tutorial.md#step-2--record-what-your-plugin-did).
 > This section is the field-level reference for the `Invocation`
 > struct, the 5-value action vocabulary, and the rules around the
 > Custom escape-hatch map.
@@ -434,7 +433,7 @@ lives in this module. The pattern mirrors `database/sql` drivers and
 
 > For a step-by-step walkthrough (in-tree file layout, out-of-tree
 > module + side-effect import, operator YAML wiring), see
-> [`GUIDE.md` Step 6](./GUIDE.md#step-6--out-of-tree-plugins). This
+> [`plugin-tutorial.md` Step 6](./plugin-tutorial.md#step-6--out-of-tree-plugins). This
 > section is the field-level reference: the factory shape and the
 > panic-on-misuse guarantees that define the registry's contract.
 
@@ -492,7 +491,7 @@ never call it. It exists to keep tests isolated from each other under
 ## Cross-references
 
 - `authbridge/authlib/pipeline/configurable.go` — the interface.
-- `authbridge/authlib/pipeline/README.md` — how plugins compose and
+- `authbridge/docs/framework-architecture.md` — how plugins compose and
   run; Configure's place in the lifecycle.
 - `authbridge/authlib/config/config.go` — `PluginEntry` YAML shape and
   parsing.

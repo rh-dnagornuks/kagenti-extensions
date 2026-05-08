@@ -5,14 +5,14 @@ from an empty file to a fully-registered plugin with config, recording,
 body access, and tests.
 
 **See also:**
-- [`CONVENTIONS.md`](./CONVENTIONS.md) — field-level reference for config,
+- [`plugin-reference.md`](./plugin-reference.md) — field-level reference for config,
   invocation recording, and the registration contract.
-- [`../pipeline/README.md`](../pipeline/README.md) — framework architecture:
-  how the pipeline composes plugins and the lifecycle of a request.
+- [`framework-architecture.md`](./framework-architecture.md) — how the pipeline
+  composes plugins and the lifecycle of a request.
 
 A step-by-step guide to building a new authbridge plugin. For reference-style
 detail on config, registration, and invocation recording, see
-[`CONVENTIONS.md`](./CONVENTIONS.md).
+[`plugin-reference.md`](./plugin-reference.md).
 
 ## What a plugin is
 
@@ -97,7 +97,7 @@ pctx.Record(pipeline.Invocation{
 })
 ```
 
-See [`CONVENTIONS.md`](./CONVENTIONS.md#emitting-session-events) for the
+See [`plugin-reference.md`](./plugin-reference.md#emitting-session-events) for the
 full field set and the 5-value action vocabulary.
 
 ## Step 3 — Reject a request
@@ -165,7 +165,7 @@ Operator YAML:
     greeting: "hola"
 ```
 
-See [`CONVENTIONS.md`](./CONVENTIONS.md#the-four-step-configure-pattern)
+See [`plugin-reference.md`](./plugin-reference.md#the-four-step-configure-pattern)
 for the strict-decode / defaults / validate / construct pattern.
 
 ## Step 5 — Body access
@@ -291,10 +291,10 @@ All optional. A plugin that doesn't implement them is treated as
 
 ## Cross-references
 
-- [`CONVENTIONS.md`](./CONVENTIONS.md) — reference detail on config
+- [`plugin-reference.md`](./plugin-reference.md) — reference detail on config
   patterns, the invocation contract, the 5-value action vocabulary,
   and the registration rules.
-- [`pipeline/README.md`](../pipeline/README.md) — how the pipeline
+- [`framework-architecture.md`](./framework-architecture.md) — how the pipeline
   composes plugins, the Run / RunResponse dispatch order, and the
   lifecycle hooks.
 - [`pipeline/plugin.go`](../pipeline/plugin.go) — the Plugin interface

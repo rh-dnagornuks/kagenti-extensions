@@ -19,7 +19,7 @@ import (
 )
 
 // jwtValidationConfig is the plugin's local config schema. See
-// authlib/plugins/CONVENTIONS.md for the decode → applyDefaults →
+// authbridge/docs/plugin-reference.md for the decode → applyDefaults →
 // validate pattern.
 type jwtValidationConfig struct {
 	// Issuer is the JWT `iss` claim expected on inbound tokens.
