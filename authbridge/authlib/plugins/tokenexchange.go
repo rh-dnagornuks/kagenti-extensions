@@ -463,8 +463,25 @@ func (p *TokenExchange) OnRequest(ctx context.Context, pctx *pipeline.Context) p
 	host := pctx.Host
 
 	result := p.inner.HandleOutbound(ctx, authHeader, host)
+	// Record an Auth.Outbound entry on every branch so operators have
+	// full outbound audit in the session stream — matches the inbound
+	// side's recording of allow/deny/bypass and mirrors the claim in the
+	// PLUGIN column that every event is attributable to a plugin.
+	// Passthrough is the "no route matched, default policy allowed"
+	// branch and is the noisiest; operators who find it too loud can
+	// either tighten routes or filter on action=passthrough in abctl.
 	switch result.Action {
 	case auth.ActionDeny:
+		appendInvocationOutbound(pctx, pipeline.Invocation{
+			Plugin:          "token-exchange",
+			Phase:           pipeline.InvocationPhaseRequest,
+			Action:          pipeline.ActionDeny,
+			Reason:          result.DenyReasonCode.String(),
+			RouteMatched:    result.RouteMatched,
+			RouteHost:       host,
+			TargetAudience:  result.TargetAudience,
+			RequestedScopes: splitScopes(result.RequestedScopes),
+		})
 		// Outbound denials almost always come from failed token exchange
 		// at the IdP (upstream unreachable, bad credentials, audience
 		// refused). The auth layer returns the HTTP status it wants to
@@ -476,8 +493,60 @@ func (p *TokenExchange) OnRequest(ctx context.Context, pctx *pipeline.Context) p
 		return pipeline.DenyStatus(result.DenyStatus, code, result.DenyReason)
 	case auth.ActionReplaceToken:
 		pctx.Headers.Set("Authorization", "Bearer "+result.Token)
+		reason := "token_replaced"
+		if result.CacheHit {
+			reason = "cache_hit"
+		}
+		appendInvocationOutbound(pctx, pipeline.Invocation{
+			Plugin:          "token-exchange",
+			Phase:           pipeline.InvocationPhaseRequest,
+			Action:          pipeline.ActionModify,
+			Reason:          reason,
+			RouteMatched:    true,
+			RouteHost:       host,
+			TargetAudience:  result.TargetAudience,
+			RequestedScopes: splitScopes(result.RequestedScopes),
+			CacheHit:        result.CacheHit,
+		})
+	default:
+		// ActionAllow / unroutable host / default-policy=passthrough all
+		// land here. Reason discriminates explicit-route-passthrough from
+		// no-route-match-default-policy; both render as "skip" in the
+		// 5-value vocab.
+		reason := "no_matching_route"
+		if result.RouteMatched {
+			reason = "route_passthrough"
+		}
+		appendInvocationOutbound(pctx, pipeline.Invocation{
+			Plugin:       "token-exchange",
+			Phase:        pipeline.InvocationPhaseRequest,
+			Action:       pipeline.ActionSkip,
+			Reason:       reason,
+			RouteMatched: result.RouteMatched,
+			RouteHost:    host,
+		})
 	}
 	return pipeline.Action{Type: pipeline.Continue}
+}
+
+// appendInvocationOutbound lazy-creates pctx.Extensions.Invocations and
+// appends one entry under Outbound. Symmetric with appendInvocationInbound
+// in jwtvalidation.go.
+func appendInvocationOutbound(pctx *pipeline.Context, entry pipeline.Invocation) {
+	if pctx.Extensions.Invocations == nil {
+		pctx.Extensions.Invocations = &pipeline.Invocations{}
+	}
+	pctx.Extensions.Invocations.Outbound = append(pctx.Extensions.Invocations.Outbound, entry)
+}
+
+// splitScopes turns a space-separated scope string into []string. Returns
+// nil for the empty string so the JSON omitempty tag drops the field
+// entirely rather than emitting "[]".
+func splitScopes(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Fields(s)
 }
 
 func (p *TokenExchange) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {

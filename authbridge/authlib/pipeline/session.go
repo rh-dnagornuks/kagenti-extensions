@@ -6,12 +6,18 @@ import (
 	"time"
 )
 
-// SessionPhase distinguishes request from response events.
+// SessionPhase distinguishes request, response, and terminal-denial events.
 type SessionPhase int
 
 const (
 	SessionRequest SessionPhase = iota
 	SessionResponse
+	// SessionDenied is a terminal event for inbound requests a pipeline
+	// plugin rejected (e.g., jwt-validation failing a token check). The
+	// listener records this instead of a Request/Response pair so abctl
+	// and other session consumers can distinguish denials from normal
+	// request/response flow without scanning StatusCode.
+	SessionDenied
 )
 
 func (p SessionPhase) String() string {
@@ -20,13 +26,15 @@ func (p SessionPhase) String() string {
 		return "request"
 	case SessionResponse:
 		return "response"
+	case SessionDenied:
+		return "denied"
 	default:
 		return "unknown"
 	}
 }
 
-// MarshalJSON emits the string form ("request"/"response") so the wire
-// format stays human-readable.
+// MarshalJSON emits the string form ("request"/"response"/"denied") so
+// the wire format stays human-readable.
 func (p SessionPhase) MarshalJSON() ([]byte, error) {
 	return json.Marshal(p.String())
 }
@@ -46,6 +54,8 @@ func (p *SessionPhase) UnmarshalJSON(data []byte) error {
 		*p = SessionRequest
 	case "response":
 		*p = SessionResponse
+	case "denied":
+		*p = SessionDenied
 	default:
 		slog.Debug("pipeline: unknown SessionPhase, defaulting to request", "value", s)
 		*p = SessionRequest
@@ -54,7 +64,13 @@ func (p *SessionPhase) UnmarshalJSON(data []byte) error {
 }
 
 // SessionEvent represents a single pipeline event captured by the session store.
-// Exactly one of A2A, MCP, or Inference is non-nil.
+// At most one of A2A, MCP, or Inference is non-nil on any given event, but
+// the event may also carry Invocations (records from any plugin that ran on
+// the pass) and/or Plugins (the escape-hatch map from Extensions.Custom)
+// regardless of which protocol extension is present. An event with
+// Phase=SessionDenied typically carries only Invocations (+ Identity, Host,
+// Error) because the request never reached a protocol parser before the
+// pipeline rejected it.
 type SessionEvent struct {
 	// SessionID is the session bucket the event was appended to. Populated by
 	// Store.Append so downstream consumers (particularly the SSE stream
@@ -69,6 +85,22 @@ type SessionEvent struct {
 	A2A       *A2AExtension
 	MCP       *MCPExtension
 	Inference *InferenceExtension
+
+	// Invocations carries records of every plugin that ran on the
+	// pipeline pass — gate, parser, rate-limiter, etc. Nil when no
+	// plugin appended a record, non-nil with at least one Inbound or
+	// Outbound entry otherwise. See Invocations godoc for the per-
+	// plugin shape.
+	Invocations *Invocations
+
+	// Plugins carries plugin-public observability events in JSON form.
+	// Populated by the listener from Extensions.Custom entries whose keys
+	// end in PluginEventSuffix ("/event"); the suffix is stripped, so
+	// consumers see the plugin name as the map key. Value is the plugin-
+	// provided struct marshaled to JSON — opaque from the listener's
+	// perspective. Consumers decode each key into their own type. See
+	// authlib/plugins/CONVENTIONS.md for the producer contract.
+	Plugins map[string]json.RawMessage
 
 	// Identity snapshot at record time. Lets downstream plugins attribute an
 	// event to the caller (Subject) and the handling sidecar (AgentID)
@@ -114,19 +146,21 @@ type SessionEvent struct {
 // writes to it directly; UnmarshalJSON reads into it and converts back.
 // Keeping the layout in one place guarantees round-trip symmetry.
 type sessionEventWire struct {
-	SessionID      string              `json:"sessionId,omitempty"`
-	At             time.Time           `json:"at"`
-	Direction      Direction           `json:"direction"`
-	Phase          SessionPhase        `json:"phase"`
-	A2A            *A2AExtension       `json:"a2a,omitempty"`
-	MCP            *MCPExtension       `json:"mcp,omitempty"`
-	Inference      *InferenceExtension `json:"inference,omitempty"`
-	Identity       *EventIdentity      `json:"identity,omitempty"`
-	StatusCode     int                 `json:"statusCode,omitempty"`
-	Error          *EventError         `json:"error,omitempty"`
-	Host           string              `json:"host,omitempty"`
-	TargetAudience string              `json:"targetAudience,omitempty"`
-	DurationMs     int64               `json:"durationMs,omitempty"`
+	SessionID      string                     `json:"sessionId,omitempty"`
+	At             time.Time                  `json:"at"`
+	Direction      Direction                  `json:"direction"`
+	Phase          SessionPhase               `json:"phase"`
+	A2A            *A2AExtension              `json:"a2a,omitempty"`
+	MCP            *MCPExtension              `json:"mcp,omitempty"`
+	Inference      *InferenceExtension        `json:"inference,omitempty"`
+	Invocations    *Invocations               `json:"invocations,omitempty"`
+	Plugins        map[string]json.RawMessage `json:"plugins,omitempty"`
+	Identity       *EventIdentity             `json:"identity,omitempty"`
+	StatusCode     int                        `json:"statusCode,omitempty"`
+	Error          *EventError                `json:"error,omitempty"`
+	Host           string                     `json:"host,omitempty"`
+	TargetAudience string                     `json:"targetAudience,omitempty"`
+	DurationMs     int64                      `json:"durationMs,omitempty"`
 }
 
 func (e SessionEvent) MarshalJSON() ([]byte, error) {
@@ -138,6 +172,8 @@ func (e SessionEvent) MarshalJSON() ([]byte, error) {
 		A2A:            e.A2A,
 		MCP:            e.MCP,
 		Inference:      e.Inference,
+		Invocations:    e.Invocations,
+		Plugins:        e.Plugins,
 		Identity:       e.Identity,
 		StatusCode:     e.StatusCode,
 		Error:          e.Error,
@@ -163,6 +199,8 @@ func (e *SessionEvent) UnmarshalJSON(data []byte) error {
 		A2A:            w.A2A,
 		MCP:            w.MCP,
 		Inference:      w.Inference,
+		Invocations:    w.Invocations,
+		Plugins:        w.Plugins,
 		Identity:       w.Identity,
 		StatusCode:     w.StatusCode,
 		Error:          w.Error,

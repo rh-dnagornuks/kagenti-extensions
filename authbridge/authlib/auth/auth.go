@@ -282,9 +282,10 @@ func (a *Auth) HandleInbound(ctx context.Context, authHeader, path, audience str
 		a.IncInboundDeny(DENY_NO_HEADER)
 		a.log.Debug("inbound denied: no Authorization header", "path", path)
 		return &InboundResult{
-			Action:     ActionDeny,
-			DenyStatus: http.StatusUnauthorized,
-			DenyReason: "missing Authorization header",
+			Action:         ActionDeny,
+			DenyStatus:     http.StatusUnauthorized,
+			DenyReason:     "missing Authorization header",
+			DenyReasonCode: DENY_NO_HEADER,
 		}
 	}
 	token := extractBearer(authHeader)
@@ -292,9 +293,10 @@ func (a *Auth) HandleInbound(ctx context.Context, authHeader, path, audience str
 		a.IncInboundDeny(DENY_MALFORMED_HEADER)
 		a.log.Debug("inbound denied: malformed Authorization header", "path", path)
 		return &InboundResult{
-			Action:     ActionDeny,
-			DenyStatus: http.StatusUnauthorized,
-			DenyReason: "invalid Authorization header format",
+			Action:         ActionDeny,
+			DenyStatus:     http.StatusUnauthorized,
+			DenyReason:     "invalid Authorization header format",
+			DenyReasonCode: DENY_MALFORMED_HEADER,
 		}
 	}
 
@@ -302,9 +304,10 @@ func (a *Auth) HandleInbound(ctx context.Context, authHeader, path, audience str
 	if a.verifier == nil {
 		a.IncInboundDeny(DENY_VALIDATOR_MISSING)
 		return &InboundResult{
-			Action:     ActionDeny,
-			DenyStatus: http.StatusUnauthorized,
-			DenyReason: "inbound validation not configured",
+			Action:         ActionDeny,
+			DenyStatus:     http.StatusUnauthorized,
+			DenyReason:     "inbound validation not configured",
+			DenyReasonCode: DENY_VALIDATOR_MISSING,
 		}
 	}
 	if audience == "" {
@@ -312,9 +315,10 @@ func (a *Auth) HandleInbound(ctx context.Context, authHeader, path, audience str
 	}
 	if audience == "" {
 		return &InboundResult{
-			Action:     ActionDeny,
-			DenyStatus: http.StatusServiceUnavailable,
-			DenyReason: "identity not yet configured (credentials pending)",
+			Action:         ActionDeny,
+			DenyStatus:     http.StatusServiceUnavailable,
+			DenyReason:     "identity not yet configured (credentials pending)",
+			DenyReasonCode: DENY_VALIDATOR_MISSING,
 		}
 	}
 	a.log.Debug("validating inbound JWT", "path", path, "expectedAudience", audience)
@@ -330,9 +334,10 @@ func (a *Auth) HandleInbound(ctx context.Context, authHeader, path, audience str
 			"expectedIssuer", a.identity.Load().Audience,
 			"error", err)
 		return &InboundResult{
-			Action:     ActionDeny,
-			DenyStatus: http.StatusUnauthorized,
-			DenyReason: "token validation failed",
+			Action:         ActionDeny,
+			DenyStatus:     http.StatusUnauthorized,
+			DenyReason:     "token validation failed",
+			DenyReasonCode: DENY_JWT_FAILED,
 		}
 	}
 
@@ -396,7 +401,14 @@ func (a *Auth) HandleOutbound(ctx context.Context, authHeader, host string) *Out
 		if cached, ok := a.cache.Get(subjectToken, audience); ok {
 			a.IncOutboundReplaceToken(OUTBOUND_ACTION_CACHE_HIT)
 			a.log.Debug("outbound cache hit", "host", host, "audience", audience)
-			return &OutboundResult{Action: ActionReplaceToken, Token: cached}
+			return &OutboundResult{
+				Action:          ActionReplaceToken,
+				Token:           cached,
+				CacheHit:        true,
+				RouteMatched:    true,
+				TargetAudience:  audience,
+				RequestedScopes: scopes,
+			}
 		}
 	}
 
@@ -437,9 +449,13 @@ func (a *Auth) HandleOutbound(ctx context.Context, authHeader, host string) *Out
 			"tokenEndpoint", resolved.TokenEndpoint,
 			"error", err)
 		return &OutboundResult{
-			Action:     ActionDeny,
-			DenyStatus: http.StatusServiceUnavailable,
-			DenyReason: "token exchange failed",
+			Action:          ActionDeny,
+			DenyStatus:      http.StatusServiceUnavailable,
+			DenyReason:      "token exchange failed",
+			DenyReasonCode:  OUTBOUND_TOKEN_EXCHANGE_FAILED,
+			RouteMatched:    true,
+			TargetAudience:  audience,
+			RequestedScopes: scopes,
 		}
 	}
 
@@ -453,7 +469,13 @@ func (a *Auth) HandleOutbound(ctx context.Context, authHeader, host string) *Out
 	a.log.Info("outbound token exchanged", "host", host, "audience", audience)
 	a.log.Debug("outbound exchange details",
 		"host", host, "audience", audience, "expiresIn", resp.ExpiresIn)
-	return &OutboundResult{Action: ActionReplaceToken, Token: resp.AccessToken}
+	return &OutboundResult{
+		Action:          ActionReplaceToken,
+		Token:           resp.AccessToken,
+		RouteMatched:    true,
+		TargetAudience:  audience,
+		RequestedScopes: scopes,
+	}
 }
 
 func (a *Auth) handleNoToken(ctx context.Context, audience, scopes string) *OutboundResult {
@@ -469,9 +491,10 @@ func (a *Auth) handleNoToken(ctx context.Context, audience, scopes string) *Outb
 			a.log.Debug("no token, client_credentials requested but exchanger not configured",
 				"audience", audience)
 			return &OutboundResult{
-				Action:     ActionDeny,
-				DenyStatus: http.StatusServiceUnavailable,
-				DenyReason: "exchanger not configured for client credentials",
+				Action:         ActionDeny,
+				DenyStatus:     http.StatusServiceUnavailable,
+				DenyReason:     "exchanger not configured for client credentials",
+				DenyReasonCode: OUTBOUND_CREDS_REQUESTED_NO_EXCHANGER,
 			}
 		}
 		a.log.Debug("no token, falling back to client_credentials",
@@ -483,9 +506,10 @@ func (a *Auth) handleNoToken(ctx context.Context, audience, scopes string) *Outb
 			a.log.Debug("client credentials failure details",
 				"audience", audience, "scopes", scopes, "error", err)
 			return &OutboundResult{
-				Action:     ActionDeny,
-				DenyStatus: http.StatusServiceUnavailable,
-				DenyReason: "client credentials token acquisition failed",
+				Action:         ActionDeny,
+				DenyStatus:     http.StatusServiceUnavailable,
+				DenyReason:     "client credentials token acquisition failed",
+				DenyReasonCode: OUTBOUND_CREDENTIALS_GRANT_FAILURE,
 			}
 		}
 		a.IncOutboundReplaceToken(OUTBOUND_ACTION_REPLACE_TOKEN)
@@ -496,9 +520,10 @@ func (a *Auth) handleNoToken(ctx context.Context, audience, scopes string) *Outb
 		a.log.Debug("no token, policy denies request",
 			"policy", a.noTokenPolicy, "audience", audience)
 		return &OutboundResult{
-			Action:     ActionDeny,
-			DenyStatus: http.StatusUnauthorized,
-			DenyReason: "missing Authorization header",
+			Action:         ActionDeny,
+			DenyStatus:     http.StatusUnauthorized,
+			DenyReason:     "missing Authorization header",
+			DenyReasonCode: OUTBOUND_NO_TOKEN,
 		}
 	}
 }

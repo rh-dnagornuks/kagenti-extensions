@@ -5,23 +5,51 @@ import "time"
 // Extensions holds typed extension slots for plugin-to-plugin communication.
 // Each slot is populated by a specific plugin and consumed by downstream plugins.
 //
-// The named slots (MCP, A2A, Security, Delegation, Inference) are reserved
-// for telemetry-worthy extensions — data that flows into SessionEvent, is
-// serialized on the wire API, and has a published schema that unrelated
-// plugins can rely on. Adding a new named slot is a core-library change.
+// The named slots (MCP, A2A, Security, Delegation, Inference, Auth) are
+// reserved for telemetry-worthy extensions — data that flows into
+// SessionEvent, is serialized on the wire API, and has a published schema
+// that unrelated plugins can rely on. Adding a new named slot is a
+// core-library change.
 //
-// For plugin-private, per-request state that doesn't need a published
-// schema, use the generic GetState / SetState helpers defined below; they
-// store values in Custom keyed by plugin name, letting a new plugin land
-// without any authlib modification.
+// For data that shouldn't drive a core-library change, use Custom. Two
+// access patterns share the same map:
+//
+//   - Plugin-PRIVATE state (cross-phase continuity inside one plugin).
+//     Use the typed SetState / GetState generics. Key is plugin.Name().
+//     Value is typically *T for a plugin-internal struct (may contain
+//     sync primitives, unexported fields, channels). Never flows to
+//     session events.
+//
+//   - Plugin-PUBLIC observability. Use a key suffixed with "/event"
+//     (e.g., "rate-limiter/event"). Value must be JSON-marshalable.
+//     The listener serializes matching entries into SessionEvent.Plugins
+//     at record time — keyed by the plugin name (suffix stripped). A
+//     new plugin can surface events to /v1/sessions without any
+//     authlib modification. See authlib/plugins/CONVENTIONS.md for the
+//     convention + promotion criteria for named-slot graduation.
+//
+// The suffix convention keeps the two intents unambiguous at write
+// time: a plugin author has to deliberately type "/event" to opt into
+// serialization, so private state can never leak by accident.
 type Extensions struct {
-	MCP        *MCPExtension
-	A2A        *A2AExtension
-	Security   *SecurityExtension
-	Delegation *DelegationExtension
-	Inference  *InferenceExtension
-	Custom     map[string]any
+	MCP         *MCPExtension
+	A2A         *A2AExtension
+	Security    *SecurityExtension
+	Delegation  *DelegationExtension
+	Inference   *InferenceExtension
+	Invocations *Invocations
+	Custom      map[string]any
 }
+
+// PluginEventSuffix is the key suffix that marks a Custom entry as
+// plugin-public observability data destined for SessionEvent.Plugins.
+// Plugin authors opt into serialization by writing:
+//
+//	pctx.Extensions.Custom["rate-limiter"+pipeline.PluginEventSuffix] = ...
+//
+// The listener strips the suffix when populating SessionEvent.Plugins,
+// so consumers see the plugin name as the map key.
+const PluginEventSuffix = "/event"
 
 // SetState stashes a typed value on pctx under key. Intended for plugin-
 // private per-request state — e.g., a rate-limiter remembering how many
@@ -148,6 +176,123 @@ type SecurityExtension struct {
 	Labels      []string `json:"labels,omitempty"`
 	Blocked     bool     `json:"blocked,omitempty"`
 	BlockReason string   `json:"blockReason,omitempty"`
+}
+
+// InvocationAction is the universal 5-value vocabulary every plugin uses
+// to describe what it did on a single pipeline pass. Every plugin —
+// gate, parser, rate-limiter, guardrail, whatever we add next —
+// MUST emit exactly one of these per Invocation so abctl and /v1/sessions
+// can render a consistent per-plugin timeline.
+//
+//	allow   — a gate plugin permitted the request. jwt-validation
+//	          returns this on successful signature + issuer + audience.
+//	deny    — a gate plugin rejected the request. Terminal for the
+//	          pipeline pass. jwt-validation on bad token,
+//	          token-exchange on upstream IdP failure.
+//	skip    — the plugin ran but didn't act. jwt-validation on a
+//	          bypass path, token-exchange on a host with no matching
+//	          route, a parser whose body didn't match its format.
+//	modify  — the plugin mutated the message. token-exchange replaced
+//	          the Authorization header with a freshly-issued token.
+//	observe — the plugin attached diagnostic data without altering
+//	          flow. All parsers use this when they successfully parse.
+//
+// Reason (the stable machine code alongside Action) can discriminate
+// within a value — e.g. skip/path_bypass vs skip/no_matching_route
+// tell different stories at the detail-pane level, but both read
+// "skip" in the at-a-glance timeline.
+//
+// Named InvocationAction rather than Action because pipeline.Action is
+// already the pipeline-directive struct (Continue / Reject); keeping
+// the names distinct avoids a shadowing foot-gun.
+type InvocationAction string
+
+const (
+	ActionAllow   InvocationAction = "allow"
+	ActionDeny    InvocationAction = "deny"
+	ActionSkip    InvocationAction = "skip"
+	ActionModify  InvocationAction = "modify"
+	ActionObserve InvocationAction = "observe"
+)
+
+// Invocations carries one record per plugin that ran on a pipeline pass,
+// split by direction so a single event's inbound and outbound plugin
+// activity stays distinguishable. Multiple plugins can contribute — each
+// appends an entry — so chained plugins cooperate without schema churn.
+// Directions are disjoint per request: a single listener pass populates
+// at most one of Inbound / Outbound.
+//
+// Replaces the earlier AuthExtension; parsers and any other plugin class
+// share the list now. abctl renders one row per Invocation, so operators
+// get a per-plugin timeline without guessing which plugins touched each
+// event.
+type Invocations struct {
+	Inbound  []Invocation `json:"inbound,omitempty"`
+	Outbound []Invocation `json:"outbound,omitempty"`
+}
+
+// Invocation records one plugin's action on one pipeline pass. Plugin is
+// the plugin's Name() for traceability. Action is the universal 5-value
+// verb (see Action). Reason is a stable machine-readable label paired
+// with the counters plugins already feed into /stats — use Reason for
+// filtering / indexing rather than Action alone when you need to
+// distinguish skip/path_bypass from skip/no_matching_route.
+//
+// Diagnostic fields are populated selectively per plugin. Auth gates
+// populate ExpectedIssuer/Audience/Token*; outbound routers populate
+// Route* and CacheHit; parsers typically populate only Plugin/Action/
+// Reason because their semantic payload lives on the typed extension
+// slots (A2A / MCP / Inference).
+//
+// NEVER contains the raw bearer token, token signature, or client
+// credentials. The session API has no auth on it; only safe-to-log data
+// belongs here.
+// InvocationPhase identifies whether an Invocation was appended during
+// the request pass or the response pass. Without this tag the full list
+// on pctx — which is cumulative across both phases — can't be correctly
+// partitioned by the listener when it records the request event and the
+// response event separately. Keeping the full list on pctx is deliberate
+// (plugins may need cross-phase context); the phase tag lets consumers
+// filter by pass.
+type InvocationPhase string
+
+const (
+	InvocationPhaseRequest  InvocationPhase = "request"
+	InvocationPhaseResponse InvocationPhase = "response"
+)
+
+type Invocation struct {
+	Plugin string           `json:"plugin"`
+	Action InvocationAction `json:"action"`
+	// Phase is the pass (request or response) that appended this
+	// record. The listener uses it to filter invocations per event at
+	// record time — the request event carries only request-phase
+	// entries, the response event only response-phase entries, even
+	// though pctx carries the union.
+	Phase  InvocationPhase `json:"phase,omitempty"`
+	Reason string          `json:"reason,omitempty"`
+
+	// Path is the request path the invocation ran on. Populated so
+	// operators can disambiguate invocations on the same plugin (e.g.
+	// a jwt-validation skip on /healthz vs /.well-known/agent.json;
+	// a mcp-parser observe on tools/call vs tools/list). Left empty
+	// when the plugin has no path context.
+	Path string `json:"path,omitempty"`
+
+	// Auth-gate context, populated when applicable.
+	ExpectedIssuer   string   `json:"expectedIssuer,omitempty"`
+	ExpectedAudience string   `json:"expectedAudience,omitempty"`
+	TokenSubject     string   `json:"tokenSubject,omitempty"`
+	TokenAudience    []string `json:"tokenAudience,omitempty"`
+	TokenScopes      []string `json:"tokenScopes,omitempty"`
+
+	// Outbound routing context. RouteMatched=true means a route rule
+	// explicitly applied; false means the default policy caught it.
+	RouteMatched    bool     `json:"routeMatched,omitempty"`
+	RouteHost       string   `json:"routeHost,omitempty"`
+	TargetAudience  string   `json:"targetAudience,omitempty"`
+	RequestedScopes []string `json:"requestedScopes,omitempty"`
+	CacheHit        bool     `json:"cacheHit,omitempty"`
 }
 
 // DelegationExtension tracks the token delegation chain across hops.

@@ -272,6 +272,125 @@ list is empty. The error message names the likely cause so the
 operator is pointed at the migration, not left wondering why
 authentication isn't happening.
 
+## Emitting session events
+
+Every plugin MUST emit at least one `Invocation` record per
+`OnRequest` / `OnResponse` call. Plugins may also populate one of the
+typed protocol extensions (`MCP`, `A2A`, `Inference`) when they carry
+structured semantic payload, and may additionally publish arbitrary
+plugin-specific events through the `Custom` escape-hatch map.
+
+### 1. Invocation record (required for every plugin)
+
+An `Invocation` says *which* plugin ran and *what* it did, in a
+5-value vocabulary shared across all plugins. abctl renders one row
+per invocation — without an invocation record, a plugin's work is
+invisible to the operator.
+
+```go
+// Append one record per OnRequest/OnResponse call. Helper functions
+// exist in each plugin package; the listener snapshot will pick them up
+// from pctx.Extensions.Invocations.
+pctx.Extensions.Invocations = &pipeline.Invocations{
+    Inbound: []pipeline.Invocation{{
+        Plugin: "jwt-validation",
+        Action: pipeline.ActionAllow,    // 5-value verb
+        Reason: "authorized",             // machine-stable reason code
+        Path:   pctx.Path,
+    }},
+}
+```
+
+The 5 actions and when to use them:
+
+| Action | Meaning | Example |
+|---|---|---|
+| `allow` | Gate plugin permitted the request | jwt-validation on valid token |
+| `deny` | Gate plugin rejected the request; pipeline stops | jwt-validation on bad token, token-exchange on IdP failure |
+| `skip` | Plugin ran but didn't act on this message | jwt-validation on a bypass path; parser whose body didn't match |
+| `modify` | Plugin mutated the message | token-exchange replaced the Authorization header |
+| `observe` | Plugin attached diagnostic data; flow unchanged | parsers extracting MCP / A2A / Inference state |
+
+`Reason` is a stable machine-readable label (e.g. `path_bypass`,
+`no_matching_route`, `jwt_failed`, `matched_tools/call`) that
+discriminates within an Action value. Filters in abctl can match on
+either — `/skip` shows every skip action regardless of reason;
+`/path_bypass` narrows to that specific skip flavour.
+
+Fields populated selectively: auth gates fill `ExpectedIssuer` /
+`ExpectedAudience` / `Token*`; outbound routers fill `Route*` and
+`CacheHit`; parsers typically fill only `Plugin` / `Action` /
+`Reason` / `Path` because their semantic payload lives on the typed
+extension slot.
+
+NEVER put raw tokens, signatures, or secrets in an `Invocation`. The
+session store has no auth.
+
+### 2. Named protocol extension (optional, for parsers)
+
+`MCP`, `A2A`, `Inference` are typed slots on `pipeline.Extensions`.
+A parser that successfully extracts structured state populates the
+matching slot AND emits an `Invocation` with `ActionObserve`. The
+slot carries the parsed payload; the Invocation carries the
+attribution.
+
+Adding a new named extension is a core-library change: edit
+`pipeline/extensions.go`, `pipeline/session.go` (wire + JSON round-
+trip), the listener (snapshot + recorder), and abctl if you want
+bespoke rendering. Most new plugins don't need one — they emit an
+Invocation and publish extra context through the Custom map
+(below).
+
+### 3. Escape-hatch map (`Custom` with `/event` suffix)
+
+For plugin-specific observability that doesn't warrant a category yet,
+write to `pctx.Extensions.Custom` with a key ending in
+`pipeline.PluginEventSuffix` (`"/event"`):
+
+```go
+// Plugin-PUBLIC event. Listener serializes this to SessionEvent.Plugins
+// under key "rate-limiter" (suffix stripped).
+pctx.Extensions.Custom["rate-limiter"+pipeline.PluginEventSuffix] = rateLimiterEvent{
+    Allowed:    true,
+    TokensLeft: 42,
+}
+
+// Plugin-PRIVATE cross-phase state. Never serialized. Used via the
+// typed SetState / GetState generics.
+pipeline.SetState(pctx, "rate-limiter", &rateLimiterState{Bucket: b})
+```
+
+The `/event` suffix is the opt-in marker: the listener only promotes
+matching keys into `SessionEvent.Plugins`. Private state stays out.
+
+Rules for plugin-public events:
+
+- **Value must be JSON-marshalable.** The listener calls `json.Marshal`;
+  failures downgrade to `slog.Debug` and skip the entry (a misbehaving
+  plugin can't break the session stream).
+- **NEVER put raw credentials or tokens in the value.** The session
+  store has no auth on it — only safe-to-log data belongs there.
+- **Key prefix MUST be the plugin's `Name()`.** Keeps namespaces clean
+  so unrelated plugins don't collide.
+- **Payload schema is plugin-owned.** No central registry; abctl
+  treats unknown keys as raw JSON in the detail pane.
+
+### Graduation: when to promote map → named category
+
+Graduate to a typed slot when ≥2 of these are true:
+
+1. **Two or more plugins share the shape.** That's the signal the
+   "category" concept is worth codifying — it prevents N plugins from
+   each shipping their own near-identical struct.
+2. **abctl or the session API grows conditional logic on the key.**
+   If consumers already parse the payload, making the schema compile-
+   checked is a net win.
+3. **The data is populated on nearly every deployment.** Core
+   semantics (auth, protocol) graduate; niche plugins stay in the map.
+
+Don't graduate speculatively — the map path has no cost if you stay
+in it.
+
 ## Cross-references
 
 - `authbridge/authlib/pipeline/configurable.go` — the interface.
@@ -280,3 +399,8 @@ authentication isn't happening.
 - `authbridge/authlib/config/config.go` — `PluginEntry` YAML shape and
   parsing.
 - `authbridge/authlib/plugins/registry.go` — how Build calls Configure.
+- `authbridge/authlib/pipeline/extensions.go` — named categories
+  (`MCP`, `A2A`, `Inference`, `Auth`) + `Custom` map + escape-hatch
+  convention.
+- `authbridge/authlib/pipeline/session.go` — `SessionEvent` wire shape
+  and the `SessionDenied` phase.

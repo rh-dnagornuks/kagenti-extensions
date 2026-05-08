@@ -26,6 +26,11 @@ func (p *InferenceParser) Capabilities() pipeline.PluginCapabilities {
 }
 
 func (p *InferenceParser) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.Action {
+	// No Invocation recorded when the parser doesn't apply to this
+	// message — wrong path (anything other than OpenAI chat/completion
+	// endpoints), empty body, or non-JSON body. Operators infer
+	// "inference-parser exists in this pipeline" from config, not per-
+	// event rows.
 	if pctx.Path != "/v1/chat/completions" && pctx.Path != "/v1/completions" {
 		return pipeline.Action{Type: pipeline.Continue}
 	}
@@ -76,6 +81,13 @@ func (p *InferenceParser) OnRequest(_ context.Context, pctx *pipeline.Context) p
 		slog.Debug("inference-parser: message", "index", i, "role", m.Role, "content", truncate(m.Content, debugBodyMax))
 	}
 
+	appendInvocationOutbound(pctx, pipeline.Invocation{
+		Plugin: "inference-parser",
+		Phase:  pipeline.InvocationPhaseRequest,
+		Action: pipeline.ActionObserve,
+		Reason: "matched_" + ext.Model,
+		Path:   pctx.Path,
+	})
 	return pipeline.Action{Type: pipeline.Continue}
 }
 
@@ -83,6 +95,8 @@ func (p *InferenceParser) OnRequest(_ context.Context, pctx *pipeline.Context) p
 // token counts) on pctx.Extensions.Inference. Handles both non-streaming
 // JSON responses and SSE streams from OpenAI-compatible servers.
 func (p *InferenceParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeline.Action {
+	// No Invocation when the parser doesn't apply — request wasn't
+	// inference or no response body to parse.
 	if len(pctx.ResponseBody) == 0 || pctx.Extensions.Inference == nil {
 		return pipeline.Action{Type: pipeline.Continue}
 	}
@@ -101,6 +115,13 @@ func (p *InferenceParser) OnResponse(_ context.Context, pctx *pipeline.Context) 
 		"completionTokens", ext.CompletionTokens,
 	)
 	slog.Debug("inference-parser: completion", "text", truncate(ext.Completion, debugBodyMax))
+	appendInvocationOutbound(pctx, pipeline.Invocation{
+		Plugin: "inference-parser",
+		Phase:  pipeline.InvocationPhaseResponse,
+		Action: pipeline.ActionObserve,
+		Reason: "matched_" + ext.Model + "_response",
+		Path:   pctx.Path,
+	})
 	return pipeline.Action{Type: pipeline.Continue}
 }
 
