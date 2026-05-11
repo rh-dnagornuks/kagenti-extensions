@@ -1490,6 +1490,12 @@ func keysOf(m map[string]json.RawMessage) []string {
 // schemeCapturePlugin captures the pctx.Scheme value it sees on
 // OnRequest. Used by the per-listener scheme-wiring tests to verify
 // each listener populates the field from its transport-native source.
+//
+// Duplicated byte-for-byte across the four listener test packages
+// (extauthz, extproc, forwardproxy, reverseproxy) rather than
+// promoted to authlib/plugintesting — the plugin shape is only
+// useful in listener tests and not worth exporting. Each package
+// has a copy with this same godoc.
 type schemeCapturePlugin struct {
 	got string
 }
@@ -1544,10 +1550,18 @@ func TestExtProc_PopulatesSchemeFromPseudoHeader(t *testing.T) {
 			if tc.scheme != "" {
 				hdrs = append(hdrs, ":scheme", tc.scheme)
 			}
+			// Use the direction-matching helper even though
+			// inboundRequest and outboundRequest share the same
+			// shape today — the test reads more clearly and guards
+			// against future drift if the helpers diverge.
+			reqFn := inboundRequest
+			if tc.direction == "outbound" {
+				reqFn = outboundRequest
+			}
 			stream := &mockStream{
 				ctx: context.Background(),
 				requests: []*extprocv3.ProcessingRequest{
-					inboundRequest(makeHeaders(hdrs...)),
+					reqFn(makeHeaders(hdrs...)),
 				},
 			}
 			_ = srv.Process(stream)

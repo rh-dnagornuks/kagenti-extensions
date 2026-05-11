@@ -430,9 +430,12 @@ func TestReverseProxy_SchemeFromTLS(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			capturer := &schemeCapturePlugin{}
-			p, err := pipeline.New([]pipeline.Plugin{capturer})
+			// BuildPipeline matches the construction used in
+			// extproc/extauthz scheme tests — keeps the four
+			// listener tests grep-parallel.
+			p, err := plugintesting.BuildPipeline([]pipeline.Plugin{capturer})
 			if err != nil {
-				t.Fatalf("pipeline.New: %v", err)
+				t.Fatalf("BuildPipeline: %v", err)
 			}
 			srv, err := NewServer(pipeline.NewHolder(p), nil, backend.URL)
 			if err != nil {

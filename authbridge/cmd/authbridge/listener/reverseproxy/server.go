@@ -239,6 +239,15 @@ func (s *Server) recordInboundReject(pctx *pipeline.Context, action pipeline.Act
 // the request line), so we read it from r.TLS instead: TLS present =>
 // https, absent => http.
 //
+// Contract note: this listener intentionally diverges from the
+// Context.Scheme godoc's "empty when undetermined" convention — it
+// always returns "http" or "https" based on r.TLS. The fallback is
+// confidently wrong when reverseproxy sits behind a TLS-terminating
+// upstream (LB, ingress): r.TLS is nil on the inner hop even though
+// the caller's actual scheme was https. Consumers that need the
+// caller's scheme in that topology should plumb X-Forwarded-Proto
+// once a trusted-upstream policy exists (not in this PR).
+//
 // Does not consult X-Forwarded-Proto. Honoring that header is only
 // safe when the upstream proxy is trusted; wiring a trust policy is
 // deferred until we have a concrete multi-hop deployment story.

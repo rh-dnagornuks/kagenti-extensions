@@ -435,9 +435,12 @@ func TestForwardProxy_PopulatesSchemeFromRequestURL(t *testing.T) {
 	defer backend.Close()
 
 	capturer := &schemeCapturePlugin{}
-	p, err := pipeline.New([]pipeline.Plugin{capturer})
+	// BuildPipeline is a thin wrapper over pipeline.New; using it
+	// across all four listener scheme tests keeps the construction
+	// one-liner identical and the tests grep-parallel.
+	p, err := plugintesting.BuildPipeline([]pipeline.Plugin{capturer})
 	if err != nil {
-		t.Fatalf("pipeline.New: %v", err)
+		t.Fatalf("BuildPipeline: %v", err)
 	}
 	srv := &Server{OutboundPipeline: pipeline.NewHolder(p), Client: http.DefaultClient}
 	proxy := httptest.NewServer(srv.Handler())
