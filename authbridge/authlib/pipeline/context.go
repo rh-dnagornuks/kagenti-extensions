@@ -139,6 +139,33 @@ type Context struct {
 	// "tried to redact, nothing matched" is valid telemetry.
 	bodyMutated         bool
 	responseBodyMutated bool
+
+	// dispatched lists the pipeline indices whose OnRequest was actually
+	// invoked (including the plugin that denied, if any). Populated by
+	// Pipeline.Run before each plugin's OnRequest call; consumed by
+	// Pipeline.RunFinish to dispatch OnFinish in LIFO to exactly the set
+	// of plugins that "reserved" per-request state.
+	//
+	// Indices (not plugin pointers) because the pipeline slice is the
+	// authoritative owner of plugin identity; pctx avoids holding a back
+	// reference so a pctx is safe to pass across pipelines in tests.
+	dispatched []int
+
+	// outcome is populated exactly once by Pipeline.RunFinish immediately
+	// before dispatching OnFinish on the first plugin. Nil during OnRequest
+	// and OnResponse. Read via Outcome() so the "nil outside OnFinish"
+	// invariant is enforced at the call site rather than via a documented
+	// zero-value contract.
+	outcome *Outcome
+
+	// inFinish is true while RunFinish is dispatching OnFinish on one
+	// of the Finisher plugins. Read by Record / SetBody / SetResponseBody
+	// to enforce the "SessionEvent is frozen during OnFinish" contract
+	// chosen for the finish hook: plugins that accidentally call
+	// Record / SetBody during cleanup hit a WARN log + no-op rather
+	// than silently mutating a SessionEvent that has already been
+	// published or a response that is already on the wire.
+	inFinish bool
 }
 
 // SetCurrentPlugin is called by Pipeline.Run / RunResponse immediately
@@ -196,6 +223,13 @@ func (c *Context) clearCurrent() {
 // For the bare (Action, Reason) case, prefer the convenience wrappers
 // (Allow / Skip / Observe / Modify) below — one line each.
 func (c *Context) Record(inv Invocation) {
+	if c.inFinish {
+		slog.Warn("pipeline: plugin called pctx.Record during OnFinish — dropped",
+			"plugin", inv.Plugin,
+			"action", inv.Action,
+			"reason", inv.Reason)
+		return
+	}
 	if inv.Plugin == "" {
 		inv.Plugin = c.currentPlugin
 	}
@@ -275,6 +309,12 @@ func (c *Context) DenyAndRecord(reason, code, message string) Action {
 // Callers should NOT assign pctx.Body directly — the listener wouldn't
 // know to propagate the change, and the Invocation wouldn't be emitted.
 func (c *Context) SetBody(newBody []byte) {
+	if c.inFinish {
+		slog.Warn("pipeline: plugin called pctx.SetBody during OnFinish — dropped (response already sent)",
+			"plugin", c.currentPlugin,
+			"new_len", len(newBody))
+		return
+	}
 	if c.currentPolicy == ErrorPolicyObserve {
 		c.recordShadowBodyMutation("request", c.Body, newBody)
 		return
@@ -292,6 +332,12 @@ func (c *Context) SetBody(newBody []byte) {
 // and the same observe-mode suppression: under ErrorPolicyObserve the
 // response body is untouched and the Invocation is marked Shadow=true.
 func (c *Context) SetResponseBody(newBody []byte) {
+	if c.inFinish {
+		slog.Warn("pipeline: plugin called pctx.SetResponseBody during OnFinish — dropped (response already sent)",
+			"plugin", c.currentPlugin,
+			"new_len", len(newBody))
+		return
+	}
 	if c.currentPolicy == ErrorPolicyObserve {
 		c.recordShadowBodyMutation("response", c.ResponseBody, newBody)
 		return
