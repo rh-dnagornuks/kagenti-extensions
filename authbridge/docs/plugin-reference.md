@@ -159,6 +159,123 @@ Shadowing auth turns authentication into a suggestion — don't do this
 in production. Shadow-mode is for third-party guardrails being
 canaried; auth gates should stay on `enforce` (the default).
 
+## Declaring plugin relationships
+
+`PluginCapabilities` carries four fields that let a plugin express how it
+relates to other plugins in the same chain. All four are checked at
+`plugins.Build` time (startup and hot-reload), and misconfigurations
+fail loud before serving traffic.
+
+```go
+type PluginCapabilities struct {
+    ReadsBody   bool
+    WritesBody  bool
+    Reads       []string
+    Writes      []string
+
+    Requires    []string   // ALL must be present + earlier (hard)
+    RequiresAny []string   // AT LEAST ONE must be present + run after it (hard)
+    After       []string   // SOFT ordering; silent if absent
+    Claims      []string   // <=1 per claim per chain (mutex)
+}
+```
+
+| Field | All present? | At least one? | Silent if absent? | Ordering enforced? |
+|---|---|---|---|---|
+| `Requires` | ✓ | — | — | ✓ |
+| `RequiresAny` | — | ✓ | — | ✓ |
+| `After` | — | — | ✓ | ✓ |
+| `Claims` | — | — | — | — (mutex) |
+
+All four are chain-scoped — validation runs within the inbound chain
+OR within the outbound chain, independently. Plugin names are
+case-sensitive and must match the `Name()` returned by the plugin.
+
+### `Requires` — hard dependency
+
+Use when your plugin hardcodes access to a specific other plugin's
+extension state. Each named plugin must be present in the same chain
+AND appear earlier (lower index). Missing or misordered fails startup.
+
+```go
+// Reads pctx.Extensions.MCP.Params["name"] directly — only makes sense
+// with mcp-parser ahead of it.
+func (p *ToolAllowlist) Capabilities() pipeline.PluginCapabilities {
+    return pipeline.PluginCapabilities{
+        Requires: []string{"mcp-parser"},
+    }
+}
+```
+
+### `RequiresAny` — hard OR
+
+Use when your plugin is protocol-agnostic (e.g. reads through
+`pctx.ContentSources()`) but genuinely needs at least one parser
+present to have anything to do. Each named plugin that IS present
+must also appear earlier. Missing-all-of-them fails startup.
+
+```go
+// PII scrubber runs against whatever parsers emit fragments; must
+// have at least one or it's silent dead code.
+func (p *PIIScrubber) Capabilities() pipeline.PluginCapabilities {
+    return pipeline.PluginCapabilities{
+        ReadsBody: true,
+        RequiresAny: []string{
+            "a2a-parser", "mcp-parser", "inference-parser",
+        },
+    }
+}
+```
+
+### `After` — soft ordering
+
+Use for optional ordering relationships: the plugin benefits from a
+named plugin running earlier when present, but runs fine without it.
+Absent named plugin is not an error.
+
+```go
+// Adds per-protocol labels to request counts if a parser is
+// present; falls back to generic labels otherwise.
+func (p *RequestCounter) Capabilities() pipeline.PluginCapabilities {
+    return pipeline.PluginCapabilities{
+        After: []string{"a2a-parser", "mcp-parser", "inference-parser"},
+    }
+}
+```
+
+### `Claims` — mutual exclusion
+
+A claim is a semantic resource that exactly one plugin per chain
+owns. Two plugins declaring the same claim fail startup.
+
+Claim strings are arbitrary, but the well-known set lives as Go
+constants in `authbridge/authlib/contracts/claims.go` — plugin
+authors reference the constants instead of string literals so
+typos are compile errors and the canonical set is greppable.
+
+```go
+import "github.com/kagenti/kagenti-extensions/authbridge/authlib/contracts"
+
+// token-exchange and token-broker both declare this; they can't
+// coexist in the same outbound chain.
+func (p *TokenExchange) Capabilities() pipeline.PluginCapabilities {
+    return pipeline.PluginCapabilities{
+        Claims: []string{contracts.ClaimAuthorizationHeader},
+    }
+}
+```
+
+Third-party plugins may declare arbitrary strings — the framework
+enforces uniqueness of whatever it sees, not "must be from the list."
+Upstream a new constant in a follow-up PR when a claim stabilizes.
+
+### Error collection
+
+When validation fails the error aggregates every violation in the
+chain, not just the first one found. Operators iterating on a
+freshly-edited YAML get one fix-list per startup attempt rather
+than a sequence of fix-one-at-a-time restarts.
+
 ## The Configurable interface
 
 ```go

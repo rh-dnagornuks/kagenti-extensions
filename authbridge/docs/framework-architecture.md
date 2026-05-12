@@ -383,7 +383,7 @@ func (p *Pipeline) Plugins() []Plugin                                        // 
 func (p *Pipeline) NeedsBody() bool                                          // OR over all plugins' BodyAccess
 ```
 
-`New` validates capability wiring at startup: every `Read` must be satisfied by some earlier plugin's `Write`.
+`New` validates capability wiring at startup: every `Read` must be satisfied by some earlier plugin's `Write`. `plugins.Build` additionally validates the cross-plugin relationship declarations — `Requires`, `RequiresAny`, `After`, `Claims` — before returning the pipeline to the listener. See [`plugin-reference.md` "Declaring plugin relationships"](./plugin-reference.md#declaring-plugin-relationships).
 
 ### Plugin lifecycle (`Start` / `Stop`)
 
