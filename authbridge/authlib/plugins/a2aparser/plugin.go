@@ -56,12 +56,25 @@ func (p *A2AParser) OnRequest(_ context.Context, pctx *pipeline.Context) pipelin
 	// Extract message fields generically — any method with params.message
 	// gets full extraction (forward-compatible with future A2A methods).
 	// A2A spec uses "contextId" (current) or "sessionId" (older drafts).
+	// Some A2A clients (notably the Python SDK used by the kagenti backend)
+	// place contextId INSIDE params.message rather than at the top-level
+	// params, so fall through to params.message.contextId when neither
+	// top-level slot is set. Without this fallback every inbound turn of
+	// an established conversation lands in the "default" session bucket
+	// instead of the real contextId — response-phase extraction later
+	// populates A2A.SessionID, but that's after the listener has already
+	// keyed the event, so abctl shows every turn under "default".
 	ext.SessionID = rpc.StringParam("contextId")
 	if ext.SessionID == "" {
 		ext.SessionID = rpc.StringParam("sessionId")
 	}
 	ext.TaskID = rpc.StringParam("taskId")
 	if msg := rpc.MapParam("message"); msg != nil {
+		if ext.SessionID == "" {
+			if cid, ok := msg["contextId"].(string); ok {
+				ext.SessionID = cid
+			}
+		}
 		if role, ok := msg["role"].(string); ok {
 			ext.Role = role
 		}
