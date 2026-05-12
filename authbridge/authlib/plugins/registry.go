@@ -3,6 +3,7 @@ package plugins
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/config"
@@ -123,6 +124,122 @@ func Build(entries []config.PluginEntry, opts ...pipeline.Option) (*pipeline.Pip
 		ps = append(ps, p)
 		policies = append(policies, e.OnError.Resolved())
 	}
+	if err := validateRelationships(ps); err != nil {
+		return nil, err
+	}
 	opts = append(opts, pipeline.WithPolicies(policies...))
 	return pipeline.New(ps, opts...)
+}
+
+// validateRelationships checks every plugin's Requires / RequiresAny /
+// After / Claims declarations against the chain it's about to run in.
+// Collects all errors across the chain into one joined error rather
+// than short-circuiting on the first — friendlier for operators
+// iterating on a freshly-edited YAML.
+//
+// Semantics:
+//
+//   - Requires: every named plugin must appear at a lower index in
+//     the chain. Missing or misordered is an error.
+//   - RequiresAny: at least one named plugin must appear at a lower
+//     index. Any named plugin that IS present must also be at a
+//     lower index.
+//   - After: if a named plugin is present, it must appear at a lower
+//     index. Silent if the named plugin is absent.
+//   - Claims: at most one plugin per unique claim string across the
+//     entire chain.
+//
+// Each rule loop uses the per-plugin Name() as the identity key. Case-
+// sensitive (Go default). If a plugin name is duplicated in a chain
+// (rare — requires config.PluginEntry.ID differentiation), the
+// earliest-occurrence index is authoritative for position checks.
+func validateRelationships(ps []pipeline.Plugin) error {
+	if len(ps) == 0 {
+		return nil
+	}
+	// Build a name->first-occurrence-index map once.
+	positions := make(map[string]int, len(ps))
+	for i, p := range ps {
+		if _, seen := positions[p.Name()]; !seen {
+			positions[p.Name()] = i
+		}
+	}
+
+	var errs []string
+
+	for i, p := range ps {
+		caps := p.Capabilities().Normalize()
+
+		// Requires — hard AND with ordering.
+		for _, req := range caps.Requires {
+			j, present := positions[req]
+			switch {
+			case !present:
+				errs = append(errs, fmt.Sprintf(
+					"plugin %q requires %q earlier in the chain, but %q is not configured",
+					p.Name(), req, req))
+			case j >= i:
+				errs = append(errs, fmt.Sprintf(
+					"plugin %q requires %q earlier in the chain, but %q appears at position %d (this plugin is at %d)",
+					p.Name(), req, req, j, i))
+			}
+		}
+
+		// RequiresAny — hard OR with ordering.
+		if len(caps.RequiresAny) > 0 {
+			anyPresentAndEarlier := false
+			for _, req := range caps.RequiresAny {
+				j, present := positions[req]
+				if !present {
+					continue
+				}
+				if j >= i {
+					// Present but misordered — report per-offender.
+					errs = append(errs, fmt.Sprintf(
+						"plugin %q lists %q under RequiresAny; %q must appear earlier (found at position %d, this plugin is at %d)",
+						p.Name(), req, req, j, i))
+					continue
+				}
+				anyPresentAndEarlier = true
+			}
+			if !anyPresentAndEarlier {
+				errs = append(errs, fmt.Sprintf(
+					"plugin %q requires at least one of %v earlier in the chain, but none are configured",
+					p.Name(), caps.RequiresAny))
+			}
+		}
+
+		// After — soft ordering.
+		for _, name := range caps.After {
+			j, present := positions[name]
+			if !present {
+				continue
+			}
+			if j >= i {
+				errs = append(errs, fmt.Sprintf(
+					"plugin %q declares After %q, but %q appears at position %d (this plugin is at %d); reorder so %q runs first",
+					p.Name(), name, name, j, i, name))
+			}
+		}
+	}
+
+	// Claims — chain-wide aggregation.
+	claimOwner := make(map[string]string, len(ps))
+	for _, p := range ps {
+		caps := p.Capabilities().Normalize()
+		for _, claim := range caps.Claims {
+			if existing, taken := claimOwner[claim]; taken && existing != p.Name() {
+				errs = append(errs, fmt.Sprintf(
+					"plugins %q and %q both claim %q; configure only one of them on this chain",
+					existing, p.Name(), claim))
+				continue
+			}
+			claimOwner[claim] = p.Name()
+		}
+	}
+
+	if len(errs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("plugin relationship validation failed:\n  - %s", strings.Join(errs, "\n  - "))
 }

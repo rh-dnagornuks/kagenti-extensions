@@ -48,6 +48,53 @@ type PluginCapabilities struct {
 	//
 	// Deprecated: use ReadsBody. Will be removed in a future release.
 	BodyAccess bool
+
+	// Requires names plugins that MUST be present in the same chain
+	// AND appear earlier (lower index). Matches are case-sensitive
+	// plugin Name() strings. A missing or misordered name causes
+	// plugins.Build to fail at startup.
+	//
+	// Use Requires when the plugin hardcodes access to a specific
+	// other plugin's extension fields — e.g., a tool-allowlist plugin
+	// that reads pctx.Extensions.MCP.Params["name"] declares
+	// Requires: []string{"mcp-parser"}. If the plugin instead reads
+	// through pctx.ContentSources() and works against any parser,
+	// see RequiresAny.
+	Requires []string
+
+	// RequiresAny names plugins of which AT LEAST ONE must be present
+	// in the same chain, and each named plugin that IS present must
+	// appear earlier. Missing-all-of-them or misordered-any-of-them
+	// causes plugins.Build to fail at startup.
+	//
+	// Use RequiresAny for protocol-agnostic plugins that read through
+	// pctx.ContentSources(). Example: a PII scrubber that consumes
+	// fragments from whatever parsers are wired in declares
+	// RequiresAny: []string{"a2a-parser", "mcp-parser", "inference-parser"}.
+	// That way a chain with no parsers fails loud instead of running
+	// the guardrail as silent dead code.
+	RequiresAny []string
+
+	// After names plugins that, IF present in the same chain, must
+	// appear earlier. Unlike Requires/RequiresAny, a missing name is
+	// not an error — After is a soft ordering hint. Useful for
+	// plugins that benefit from earlier state being populated but
+	// degrade gracefully without it.
+	After []string
+
+	// Claims declares semantic resources the plugin takes exclusive
+	// ownership of. Within a single chain, at most one plugin may
+	// declare any given claim string; two plugins with an overlapping
+	// claim cause plugins.Build to fail at startup.
+	//
+	// Claim strings are arbitrary but authors should prefer the
+	// constants in authlib/contracts/ (e.g. contracts.ClaimAuthorizationHeader)
+	// so typos are compile errors and the canonical set is greppable.
+	// Third-party plugins may declare their own strings; the framework
+	// enforces uniqueness of whatever it sees, not "must be from the
+	// list." See authlib/contracts/claims.go for the canonical
+	// vocabulary.
+	Claims []string
 }
 
 // Normalize applies compatibility rules to a PluginCapabilities:
