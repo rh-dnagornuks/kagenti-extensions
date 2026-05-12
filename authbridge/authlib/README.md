@@ -8,6 +8,7 @@ A pure Go library providing reusable building blocks for JWT validation, OAuth 2
 
 | Package | Purpose |
 |---------|---------|
+| `contracts/` | Tiny, stable vocabulary plugins depend on without importing each other — role constants (`RoleUser`, `RoleAssistant`, …), the `ContentSource` / `Fragment` shape for guardrail-parser interop, and claim constants (`ClaimAuthorizationHeader`, …) for `PluginCapabilities.Claims` mutex declarations. |
 | `bypass/` | Path pattern matcher for public endpoints (health, agent card). Any inbound gate plugin (jwt-validation, SAML, mTLS) can use it. |
 | `routing/` | Host-to-audience router with glob pattern matching. Used by token-exchange; future routed plugins are expected to reuse it. |
 | `auth/` | Composition layer: `HandleInbound` + `HandleOutbound` — used internally by the `jwt-validation` and `token-exchange` plugins. Lingering in authlib/ for now; plugin-internal in practice. |
