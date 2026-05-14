@@ -4,15 +4,24 @@ This file provides context for Claude (AI assistant) when working with the `Auth
 For repo-level context (CI/CD, cross-component relationships), see [`../CLAUDE.md`](../CLAUDE.md).
 The sidecar injection webhook lives in [kagenti-operator](https://github.com/kagenti/kagenti-operator).
 
-## Unified Binary
+## Binaries
 
-The `cmd/authbridge/` directory contains the unified authbridge binary that replaces the
-old `go-processor` ext_proc server. It supports three modes (`envoy-sidecar`, `waypoint`,
-`proxy-sidecar`) with shared auth logic in `authlib/`. See [`cmd/authbridge/README.md`](cmd/authbridge/README.md)
-for config format and [`authlib/README.md`](authlib/README.md) for the library reference.
+The unified `cmd/authbridge/` binary has been split into three mode-specific
+binaries with shared auth logic in `authlib/`:
 
-The old `authproxy/go-processor/` has been removed. All development targets
-`authlib/` and `cmd/authbridge/`.
+- `cmd/authbridge-proxy/` — proxy-sidecar mode (default). HTTP forward + reverse
+  proxies. Full plugin set (jwt-validation, token-exchange, a2a-parser,
+  mcp-parser, inference-parser).
+- `cmd/authbridge-envoy/` — envoy-sidecar mode. ext_proc gRPC server hooked
+  into Envoy. Full plugin set.
+- `cmd/authbridge-lite/` — proxy-sidecar mode, lite plugin set (auth gates
+  only, parsers dropped). For size-optimized deployments that don't need
+  protocol-aware session events.
+
+Each binary is hardcoded to its deployment shape; mode is no longer selected
+at runtime. The YAML `mode:` field must match the binary or boot fails.
+
+See [`authlib/README.md`](authlib/README.md) for the library reference.
 
 ## What AuthBridge Does
 
@@ -38,17 +47,20 @@ authbridge/
 │   ├── auth/                         #   HandleInbound + HandleOutbound composition
 │   └── config/                       #   Mode presets, YAML config, validation
 │
-├── cmd/authbridge/                   # Unified binary — 3 listener modes, 1 codebase
-│   ├── listener/extauthz/            #   ext_authz adapter (waypoint mode)
-│   ├── listener/extproc/             #   ext_proc adapter (envoy-sidecar mode)
-│   ├── Dockerfile.envoy              #   envoy-sidecar combined image (Envoy + authbridge + spiffe-helper)
-│   ├── Dockerfile.proxy              #   proxy-sidecar combined image (authbridge-proxy + spiffe-helper)
-│   ├── entrypoint-envoy.sh           #   Process supervisor for Dockerfile.envoy
-│   └── entrypoint-proxy.sh           #   Process supervisor for Dockerfile.proxy
+├── cmd/authbridge-proxy/             # proxy-sidecar mode (default). Full plugin set.
+│   ├── main.go
+│   ├── Dockerfile                    #   proxy-sidecar combined image (authbridge-proxy + spiffe-helper)
+│   └── entrypoint.sh
 │
-├── cmd/authbridge-proxy/             # Lite binary — proxy-sidecar mode only, no gRPC
+├── cmd/authbridge-envoy/             # envoy-sidecar mode. Full plugin set.
+│   ├── main.go
+│   ├── Dockerfile                    #   envoy-sidecar combined image (Envoy + authbridge-envoy + spiffe-helper)
+│   └── entrypoint.sh
 │
-├── cmd/authbridge-envoy/             # Lite binary — envoy-sidecar mode only
+├── cmd/authbridge-lite/              # proxy-sidecar mode. Lite plugin set (no parsers).
+│   ├── main.go
+│   ├── Dockerfile                    #   proxy-sidecar lite combined image
+│   └── entrypoint.sh
 │
 ├── authproxy/                        # iptables init container + standalone quickstart
 │   ├── init-iptables.sh              #   iptables setup for envoy-sidecar mode
@@ -82,10 +94,12 @@ authbridge/
 
 ## Component Details
 
-### AuthBridge Unified Binary (cmd/authbridge/)
+### AuthBridge Binaries (cmd/authbridge-{proxy,envoy,lite}/)
 
-The unified authbridge binary handles both traffic directions. Auth logic lives in `authlib/`,
-with protocol-specific listeners in `cmd/authbridge/listener/`:
+The mode-specific authbridge binaries handle both traffic directions. Auth logic
+and all listener implementations live in `authlib/` (under `authlib/listener/`);
+each binary's `main.go` just imports the listeners it needs and the plugins it
+wants to register.
 
 **Inbound path** (`x-authbridge-direction: inbound`):
 - Validates JWT signature via JWKS (auto-refreshing cache from `TOKEN_URL`-derived JWKS endpoint)
@@ -111,7 +125,7 @@ with protocol-specific listeners in `cmd/authbridge/listener/`:
 
 **Configuration loading:**
 - YAML config with `${ENV_VAR}` expansion, mode presets, and startup validation.
-- Plugin settings are local to each plugin under `pipeline.*.plugins[].config`; the runtime YAML itself only carries `mode`, `listener`, `session`, `stats`, and the pipeline composition. See [`cmd/authbridge/README.md`](cmd/authbridge/README.md) for the per-mode YAML shape and [`docs/plugin-reference.md`](docs/plugin-reference.md) for the per-plugin decode pattern.
+- Plugin settings are local to each plugin under `pipeline.*.plugins[].config`; the runtime YAML itself only carries `mode`, `listener`, `session`, `stats`, and the pipeline composition. See [`docs/plugin-reference.md`](docs/plugin-reference.md) for the per-plugin decode pattern.
 - The operator-supplied env vars (`KEYCLOAK_URL`, `KEYCLOAK_REALM`, `TOKEN_URL`, `ISSUER`, `DEFAULT_OUTBOUND_POLICY`, `CLIENT_ID`) are consumed by the default `authbridge-combined.yaml` via `${VAR}` expansion — they land inside the appropriate plugin's `config:` block rather than a top-level section.
 - `jwt-validation` derives `jwks_url` from `issuer` when omitted (appends `/protocol/openid-connect/certs`).
 - `token-exchange` derives `token_url` from `keycloak_url + keycloak_realm` when omitted (Keycloak convention).
@@ -255,12 +269,15 @@ make load-images                    # Uses KIND_CLUSTER_NAME env var (default: k
 # Build the combined sidecar images (from authbridge/ context).
 # Pick the one matching your deployment mode:
 #
-#   authbridge-envoy = Envoy + authbridge (ext_proc) + spiffe-helper
-#   authbridge       = authbridge-proxy + spiffe-helper (default mode, no Envoy)
-cd .. && podman build -f cmd/authbridge/Dockerfile.envoy -t authbridge-envoy:latest .
-podman build -f cmd/authbridge/Dockerfile.proxy -t authbridge:latest .
+#   authbridge       = proxy-sidecar combined (authbridge-proxy + spiffe-helper, full plugins)
+#   authbridge-envoy = envoy-sidecar combined (Envoy + authbridge-envoy ext_proc + spiffe-helper)
+#   authbridge-lite  = proxy-sidecar lite (authbridge-lite + spiffe-helper, no parsers)
+cd .. && podman build -f cmd/authbridge-envoy/Dockerfile -t authbridge-envoy:latest .
+podman build -f cmd/authbridge-proxy/Dockerfile -t authbridge:latest .
+podman build -f cmd/authbridge-lite/Dockerfile -t authbridge-lite:latest .
 kind load docker-image authbridge-envoy:latest --name kagenti
 kind load docker-image authbridge:latest --name kagenti
+kind load docker-image authbridge-lite:latest --name kagenti
 
 # Deploy auth-proxy + demo-app
 make deploy
@@ -395,13 +412,13 @@ See [`docs/framework-architecture.md`](docs/framework-architecture.md#9-config-h
 
 ## Code Conventions
 
-### Go (authlib, cmd/authbridge, demo-app)
-- Go 1.24
-- Two modules: `authbridge/authlib/` (pure library) and `authbridge/cmd/authbridge/` (binary + listeners)
-- `authbridge/go.work` workspace links both modules for local development
-- Logging with `log.Printf` (stdlib), prefixed by `[Config]`, `[Token Exchange]`, `[Inbound]`, `[JWT Debug]`
-- gRPC ext-proc using `envoyproxy/go-control-plane` types (in cmd/authbridge)
-- JWT validation with `lestrrat-go/jwx/v2` (in authlib/validation)
+### Go (authlib, cmd/authbridge-{proxy,envoy,lite}, demo-app)
+- Go 1.25
+- Modules: `authbridge/authlib/` (pure library — all listeners, all plugins) and `authbridge/cmd/authbridge-{proxy,envoy,lite}/` (mode-specific binaries that wire listeners + plugins together)
+- `authbridge/go.work` workspace links the modules for local development
+- Logging with `log/slog`; the binaries log under their own name (`authbridge-proxy`, `authbridge-envoy`, `authbridge-lite`)
+- gRPC ext-proc using `envoyproxy/go-control-plane` types (in `authlib/listener/extproc`)
+- JWT validation with `lestrrat-go/jwx/v2` (in `authlib/plugins/jwtvalidation/validation`)
 
 ### Python (client-registration, setup scripts)
 - Python 3.12 syntax (type hints: `str | None`)
