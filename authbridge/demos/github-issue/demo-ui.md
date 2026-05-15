@@ -35,22 +35,27 @@ providing end-to-end security:
 │  ┌───────────────────────────────────────────────────────────────────────────┐   │
 │  │                  GIT-ISSUE-AGENT POD (namespace: team1)                   │   │
 │  │                                                                           │   │
-│  │  ┌─────────────────┐  ┌─────────────┐  ┌──────────────────────────────┐   │   │
-│  │  │ git-issue-agent │  │   spiffe-   │  │      client-registration     │   │   │
-│  │  │  (A2A agent,    │  │   helper    │  │  (registers with Keycloak    │   │   │
-│  │  │   port 8000)    │  │             │  │   using SPIFFE ID)           │   │   │
-│  │  └─────────────────┘  └─────────────┘  └──────────────────────────────┘   │   │
-│  │                                                                           │   │
-│  │  ┌───────────────────────────────────────────────────────────────────┐    │   │
-│  │  │                AuthProxy Sidecar (envoy-proxy container)          │    │   │
-│  │  │  Envoy + ext_proc (authbridge)                                    │    │   │
-│  │  │  Inbound (port 15124):                                            │    │   │
-│  │  │    - Validates JWT (signature + issuer + audience via JWKS)       │    │   │
-│  │  │    - Returns 401 Unauthorized for invalid/missing tokens          │    │   │
-│  │  │  Outbound (port 15123):                                           │    │   │
-│  │  │    - HTTP: Exchanges token via Keycloak → aud: github-tool        │    │   │
-│  │  │    - HTTPS: TLS passthrough (no interception)                     │    │   │
-│  │  └───────────────────────────────────────────────────────────────────┘    │   │
+│  │  ┌─────────────────┐  ┌────────────────────────────────────────────┐   │   │
+│  │  │ git-issue-agent │  │  AuthBridge sidecar (combined image)        │   │   │
+│  │  │  (A2A agent,    │  │  Container name depends on resolved mode:   │   │   │
+│  │  │   port 8000)    │  │    proxy-sidecar (default): authbridge-proxy│   │   │
+│  │  └─────────────────┘  │    envoy-sidecar:           envoy-proxy     │   │   │
+│  │                       │                                              │   │   │
+│  │                       │  Inbound:                                    │   │   │
+│  │                       │    - Validates JWT (signature + issuer +     │   │   │
+│  │                       │      audience via JWKS)                      │   │   │
+│  │                       │    - Returns 401 for invalid/missing tokens  │   │   │
+│  │                       │  Outbound:                                   │   │   │
+│  │                       │    - HTTP: Exchanges token via Keycloak      │   │   │
+│  │                       │      → aud: github-tool                      │   │   │
+│  │                       │    - HTTPS: TLS passthrough                  │   │   │
+│  │                       │                                              │   │   │
+│  │                       │  spiffe-helper bundled inside the image     │   │   │
+│  │                       │  (gated by SPIRE_ENABLED).                   │   │   │
+│  │                       │  Keycloak client registration is             │   │   │
+│  │                       │  operator-managed; the resulting Secret      │   │   │
+│  │                       │  is mounted at /shared/client-{id,secret}.txt│   │   │
+│  │                       └────────────────────────────────────────────┘   │   │
 │  └───────────────────────────────────────────────────────────────────────────┘   │
 │                                      │                                           │
 │                      Exchanged token │(aud: github-tool)                         │
@@ -384,23 +389,8 @@ Wait for the Shipwright build to complete and the deployment to become ready.
 kubectl get pods -n team1
 ```
 
-Expected output depends on how the **kagenti-operator** feature gate
-[`combinedSidecar`](https://github.com/kagenti/kagenti/blob/main/docs/authbridge/deployment-guide.md)
-is set (cluster-wide Helm / `kagenti-feature-gates` ConfigMap — not the import UI).
-
-**Legacy separate sidecars** (`combinedSidecar: false`, default in many installs):
-
-```
-NAME                               READY   STATUS    RESTARTS   AGE
-git-issue-agent-58768bdb67-xxxxx   4/4     Running   0          2m
-github-tool-7f8c9d6b44-yyyyy      1/1     Running   0          5m
-```
-
-> **Note:** The agent pod shows **4/4** — the agent container plus three AuthBridge
-> sidecars (envoy-proxy, spiffe-helper, kagenti-client-registration) and an init
-> container (`proxy-init`) that does not count toward `READY` the same way.
-
-**Combined AuthBridge** (`combinedSidecar: true`, [kagenti-extensions#254](https://github.com/kagenti/kagenti-extensions/pull/254)):
+Expected output (after kagenti-extensions#411 / kagenti-operator#361:
+one combined AuthBridge sidecar, registration is operator-managed):
 
 ```
 NAME                               READY   STATUS    RESTARTS   AGE
@@ -408,50 +398,58 @@ git-issue-agent-77fc7dc6cd-xxxxx   2/2     Running   0          2m
 github-tool-7f8c9d6b44-yyyyy      1/1     Running   0          5m
 ```
 
-> **Note:** The agent pod shows **2/2** — the **agent** container plus a single
-> **authbridge** container (Envoy, authbridge, spiffe-helper, and client-registration
-> processes inside it), plus **`proxy-init`** as an init container. Shipwright
-> **BuildRun** pods may still appear as `Completed` with a different ready count.
+> **Note:** The agent pod shows **2/2** — the agent container plus the
+> AuthBridge sidecar. In envoy-sidecar mode you'll also see a
+> `proxy-init` init container that exits after setting up iptables.
+> Shipwright **BuildRun** pods may still appear as `Completed` with a
+> different ready count.
 
 ### Verify injected containers
 
 ```bash
-kubectl get pod -n team1 -l app.kubernetes.io/name=git-issue-agent -o jsonpath='{.items[0].spec.containers[*].name}'
+kubectl get pod -n team1 -l app.kubernetes.io/name=git-issue-agent \
+  -o jsonpath='{.items[0].spec.containers[*].name}'
 ```
 
-Expected — **legacy** (three sidecars):
+Expected (proxy-sidecar mode, the cluster default):
 
 ```
-agent kagenti-client-registration envoy-proxy spiffe-helper
+agent authbridge-proxy
 ```
 
-Expected — **combined** (`combinedSidecar: true`):
+Or, in envoy-sidecar mode:
 
 ```
-agent authbridge
+agent envoy-proxy
 ```
 
-### Check client registration
+### Check operator-managed client registration
 
-**Legacy** — logs are in the client-registration sidecar:
+After kagenti-operator#361 client registration runs in the operator
+(outside the workload pod). Verify the resulting Secret is mounted
+into the agent's sidecar:
 
 ```bash
-kubectl logs deployment/git-issue-agent -n team1 -c kagenti-client-registration
+kubectl get pod -n team1 -l app.kubernetes.io/name=git-issue-agent \
+  -o jsonpath='{.items[0].spec.volumes[?(@.secret)].secret.secretName}'
+# Expect a Secret name starting with: kagenti-keycloak-client-credentials-
 ```
 
-**Combined** — use the `authbridge` container (client-registration runs inside it):
+Follow the operator-side reconciler:
 
 ```bash
-kubectl logs deployment/git-issue-agent -n team1 -c authbridge --tail=200
+kubectl logs -n kagenti-system deployment/kagenti-controller-manager \
+  | grep -iE "clientregistration|git-issue-agent" | tail -20
 ```
 
-Expected (same messages; search for “Client registration” / `SPIFFE` if the stream is busy):
+Expected (operator log lines, exact format depends on the operator's
+log format):
 
 ```
-SPIFFE credentials ready!
-Client ID (SPIFFE ID): spiffe://localtest.me/ns/team1/sa/git-issue-agent
-Created Keycloak client "spiffe://localtest.me/ns/team1/sa/git-issue-agent"
-Client registration complete!
+ClientRegistrationReconciler: ensured Keycloak client
+  spiffe://localtest.me/ns/team1/sa/git-issue-agent
+ClientRegistrationReconciler: wrote Secret
+  kagenti-keycloak-client-credentials-<hex8>
 ```
 
 ### Check agent logs
@@ -477,10 +475,11 @@ INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
 
 > **These warnings are expected and harmless.** The agent's built-in auth code
 > probes for SVID and client-secret files at startup. With AuthBridge, these files
-> are used by the sidecars (spiffe-helper, client-registration, Envoy), not by the
-> agent container directly. The agent falls back to JWKS-based JWT validation
-> (`JWKS_URI is set`), which is the correct behavior — AuthBridge's Envoy sidecar
-> handles inbound JWT validation and outbound token exchange on behalf of the agent.
+> are produced and consumed inside the AuthBridge sidecar (and the operator's
+> ClientRegistrationReconciler), not by the agent container directly. The agent
+> falls back to JWKS-based JWT validation (`JWKS_URI is set`), which is the
+> correct behavior — AuthBridge handles inbound JWT validation and outbound
+> token exchange on behalf of the agent.
 > These warnings will be removed once the agent's built-in auth logic is cleaned up
 > ([kagenti/agent-examples#129](https://github.com/kagenti/agent-examples/issues/129)).
 
@@ -743,16 +742,21 @@ exit
 
 ### 9e. Verify AuthProxy Logs (Inbound + Outbound)
 
-Check the ext_proc logs to confirm both inbound validation and outbound token
-exchange are working. Envoy and authbridge log to the **`envoy-proxy`** container in
-legacy mode, or to **`authbridge`** when
-[`combinedSidecar`](https://github.com/kagenti/kagenti/blob/main/docs/authbridge/deployment-guide.md)
-is enabled — replace `-c envoy-proxy` with `-c authbridge` below.
+Check the AuthBridge sidecar logs to confirm both inbound validation and
+outbound token exchange are working. The combined sidecar handles both
+directions; the container name depends on the resolved AuthBridge mode
+(`authbridge-proxy` for proxy-sidecar, `envoy-proxy` for envoy-sidecar).
+
+```bash
+SIDECAR=$(kubectl get pod -n team1 -l app.kubernetes.io/name=git-issue-agent \
+  -o jsonpath='{.items[0].spec.containers[*].name}' | tr ' ' '\n' \
+  | grep -E '^(authbridge-proxy|envoy-proxy)$' | head -1)
+```
 
 **Inbound validation logs:**
 
 ```bash
-kubectl logs deployment/git-issue-agent -n team1 -c envoy-proxy 2>&1 | grep "\[Inbound\]"
+kubectl logs deployment/git-issue-agent -n team1 -c "$SIDECAR" 2>&1 | grep "\[Inbound\]"
 ```
 
 Expected:
@@ -765,7 +769,7 @@ Expected:
 **Outbound token exchange logs:**
 
 ```bash
-kubectl logs deployment/git-issue-agent -n team1 -c envoy-proxy 2>&1 | grep "^2026/" | grep "\[Token Exchange\]"
+kubectl logs deployment/git-issue-agent -n team1 -c "$SIDECAR" 2>&1 | grep "^2026/" | grep "\[Token Exchange\]"
 ```
 
 Expected:
@@ -1009,8 +1013,12 @@ shape) and never serves ext_proc, so Envoy cannot complete the request.
 **Diagnose:**
 
 ```bash
-kubectl logs deployment/git-issue-agent -n team1 -c envoy-proxy 2>&1 | grep -E "failed to load routes|unmarshal"
-kubectl logs deployment/git-issue-agent -n team1 -c authbridge 2>&1 | grep -E "failed to load routes|unmarshal"
+# AuthBridge sidecar — name depends on the resolved mode:
+SIDECAR=$(kubectl get pod -n team1 -l app.kubernetes.io/name=git-issue-agent \
+  -o jsonpath='{.items[0].spec.containers[*].name}' | tr ' ' '\n' \
+  | grep -E '^(authbridge-proxy|envoy-proxy)$' | head -1)
+kubectl logs deployment/git-issue-agent -n team1 -c "$SIDECAR" 2>&1 \
+  | grep -E "failed to load routes|unmarshal"
 kubectl get configmap authproxy-routes -n team1 -o jsonpath='{.data.routes\.yaml}{"\n"}'
 ```
 
@@ -1105,24 +1113,26 @@ kubectl rollout restart deployment/git-issue-agent -n team1
 
 ### Agent Pod Not Starting (not fully ready)
 
-**Symptom:** Pod never reaches the expected ready count — **4/4** (legacy sidecars) or
-**2/2** (combined `authbridge` mode). Example: `3/4`, `1/2`, or `CrashLoopBackOff`.
+**Symptom:** Pod never reaches **2/2** ready. Example: `1/2` or `CrashLoopBackOff`.
 
-**Fix:** Check logs on the containers that exist. **Legacy** (`combinedSidecar: false`):
-
-```bash
-kubectl logs deployment/git-issue-agent -n team1 -c kagenti-client-registration
-kubectl logs deployment/git-issue-agent -n team1 -c spiffe-helper
-kubectl logs deployment/git-issue-agent -n team1 -c envoy-proxy
-kubectl logs deployment/git-issue-agent -n team1 -c agent
-```
-
-**Combined** (`combinedSidecar: true` — single `authbridge` sidecar):
+**Fix:** Check the agent and the AuthBridge sidecar; if the issue is
+operator-managed registration not finishing, the pod waits on
+`/shared/client-{id,secret}.txt`.
 
 ```bash
-kubectl logs deployment/git-issue-agent -n team1 -c authbridge
+# AuthBridge sidecar — name depends on resolved mode:
+#   proxy-sidecar (default): authbridge-proxy
+#   envoy-sidecar:           envoy-proxy
+kubectl logs deployment/git-issue-agent -n team1 -c authbridge-proxy
 kubectl logs deployment/git-issue-agent -n team1 -c agent
+
+# In envoy-sidecar mode, the proxy-init init container runs once;
+# inspect its log via --previous if it exited with an error:
 kubectl logs deployment/git-issue-agent -n team1 -c proxy-init --previous 2>/dev/null
+
+# Operator-managed registration:
+kubectl logs -n kagenti-system deployment/kagenti-controller-manager \
+  | grep -iE "clientregistration|git-issue-agent" | tail -20
 ```
 
 ### Tool MCP Server Unreachable / Connection Reset
