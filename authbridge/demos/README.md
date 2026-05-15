@@ -19,8 +19,8 @@ more AuthBridge capabilities.
 | **[Weather Agent (advanced)](weather-agent/demo-ui-advanced.md)** | Intermediate | Inbound on agent **and** tool, outbound token exchange, ingress JWT verification on the tool | [kubectl + script](weather-agent/demo-ui-advanced.md#automated-deploy-and-verify-ci-oriented) |
 | **[GitHub Issue Agent](github-issue/demo.md)** | Intermediate | Inbound validation + outbound token exchange + scope-based access control | [UI](github-issue/demo-ui.md) or [Manual](github-issue/demo-manual.md) |
 | **[Webhook](webhook/README.md)** | Intermediate | Webhook-based sidecar injection with auth-target demo app | Manual |
-| ~~**[Single Target](single-target/demo.md)**~~ ⚠️ | Advanced | Manual AuthBridge deployment (no webhook) with SPIFFE identity | Manual |
-| ~~**[Multi-Target](multi-target/demo.md)**~~ ⚠️ | Advanced | Route-based token exchange to multiple target services | Manual |
+| ~~**[Single Target](single-target/demo.md)**~~ ⚠️ **(broken — see below)** | Advanced | Manual AuthBridge deployment (no webhook) with SPIFFE identity | Manual |
+| ~~**[Multi-Target](multi-target/demo.md)**~~ ⚠️ **(broken — see below)** | Advanced | Route-based token exchange to multiple target services | Manual |
 
 > **⚠️ Single Target / Multi-Target demos are currently broken** after
 > kagenti-extensions#411. The YAMLs use the pre-#411 multi-sidecar pattern

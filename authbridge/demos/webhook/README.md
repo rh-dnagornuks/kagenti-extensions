@@ -119,7 +119,7 @@ After kagenti-extensions#411 / kagenti-operator#361 the operator resolves AuthBr
 3. The deprecated `kagenti.io/authbridge-mode` pod annotation (still honored).
 4. Cluster-wide default — `proxy-sidecar`.
 
-The previous `combinedSidecar` feature gate and the `envoyProxy` / `spiffeHelper` / `clientRegistration` per-sidecar gates were removed; their behavior was the legacy multi-sidecar shape that no longer exists. The legacy `kagenti.io/client-registration-inject: "true"` label is **no longer functional** — setting it today silently disables registration (the operator's `SkipReason` still honors it and steps aside, but the in-pod sidecar that was supposed to take over is gone). Do not add it to new manifests.
+**All four feature gates (`combinedSidecar`, `envoyProxy`, `spiffeHelper`, `clientRegistration`) are removed.** Their behavior was the legacy multi-sidecar shape that no longer exists. The legacy `kagenti.io/client-registration-inject: "true"` label is also **no longer functional** — setting it today silently disables registration (the operator's `SkipReason` still honors it and steps aside, but the in-pod sidecar that was supposed to take over is gone). Do not add it to new manifests.
 
 To pick a mode for a specific workload, set it on the AgentRuntime CR:
 

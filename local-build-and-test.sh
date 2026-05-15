@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # Local Build and Test Script for JWT-SVID Authentication
 # This script builds all necessary images locally and loads them into Kind
@@ -14,7 +14,7 @@ CLUSTER_NAME="${CLUSTER_NAME:-kagenti-dev}"
 
 # Auto-detect container runtime (Podman or Docker)
 # If KIND_EXPERIMENTAL_PROVIDER is set to podman, use it regardless of what's installed
-if [ "${KIND_EXPERIMENTAL_PROVIDER}" = "podman" ]; then
+if [ "${KIND_EXPERIMENTAL_PROVIDER:-}" = "podman" ]; then
     CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-podman}"
 elif ! command -v docker &> /dev/null && command -v podman &> /dev/null; then
     # Docker not available but Podman is
@@ -31,7 +31,7 @@ load_image_to_kind() {
     if [ "${CONTAINER_RUNTIME}" = "podman" ]; then
         # Podman: save to tar and load
         # Replace colons and slashes to make valid filename
-        local tar_file="/tmp/$(echo ${image_name} | sed 's|[:/]|-|g').tar"
+        local tar_file="/tmp/$(echo "${image_name}" | sed 's|[:/]|-|g').tar"
         ${CONTAINER_RUNTIME} save "${image_name}" -o "${tar_file}"
         kind load image-archive "${tar_file}" --name "${CLUSTER_NAME}"
         rm -f "${tar_file}"
