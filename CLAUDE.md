@@ -229,11 +229,25 @@ When the operator injects sidecars, the target namespace needs these resources:
 
 ### Building Everything Locally
 
-```bash
-# AuthProxy images
-cd authbridge/proxy-init && make build-images
+The repo-root `local-build-and-test.sh` orchestrates every image
+the platform needs (`spiffe-idp-setup` from kagenti, plus
+`authbridge`, `authbridge-envoy`, `authbridge-lite`, `proxy-init`
+from this repo) and loads them into a Kind cluster:
 
-# Client registration (no separate build needed, uses Dockerfile directly)
+```bash
+KAGENTI_DIR=../kagenti ./local-build-and-test.sh
+```
+
+To build a single image directly:
+
+```bash
+# proxy-init (iptables init container, envoy-sidecar mode)
+cd authbridge/proxy-init && make docker-build-init
+
+# Combined sidecars (proxy-sidecar default / envoy-sidecar / lite)
+cd authbridge && podman build -f cmd/authbridge-proxy/Dockerfile -t authbridge:latest .
+cd authbridge && podman build -f cmd/authbridge-envoy/Dockerfile -t authbridge-envoy:latest .
+cd authbridge && podman build -f cmd/authbridge-lite/Dockerfile  -t authbridge-lite:latest  .
 ```
 
 ### Running the Full Demo

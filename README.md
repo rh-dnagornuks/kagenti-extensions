@@ -49,8 +49,8 @@ make pre-commit
 # Run formatters
 make fmt
 
-# Build AuthProxy Docker images
-make build-images
+# Build the proxy-init iptables init container image
+make build-proxy-init
 
 # Run local testing (requires Kind cluster)
 ./local-build-and-test.sh

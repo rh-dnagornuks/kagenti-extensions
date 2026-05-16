@@ -417,7 +417,10 @@ See [`docs/framework-architecture.md`](docs/framework-architecture.md#9-config-h
 ### Modifying Token Exchange Logic
 - Edit `authlib/exchange/` -- the RFC 8693 token exchange client
 - The token exchange POST parameters follow RFC 8693 exactly
-- Test by rebuilding: `make build-images && make load-images`
+- Test by rebuilding the affected combined image (e.g.,
+  `cd authbridge && podman build -f cmd/authbridge-envoy/Dockerfile
+  -t authbridge-envoy:latest .` then `kind load docker-image
+  authbridge-envoy:latest --name kagenti`).
 
 ### Modifying Inbound JWT Validation
 - Edit `authlib/validation/` -- the JWKS-backed JWT verifier
