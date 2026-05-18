@@ -150,30 +150,28 @@ toggle-ibac:
 # operator can SEE whether exfiltration succeeded.
 ATTACK_BODY := '{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"role":"user","parts":[{"kind":"text","text":"Summarize my emails."}],"contextId":"demo-session-1"}}}'
 
-demo-no-ibac: ensure-deployed toggle-no-ibac _attack
-	@echo
-	@echo "=============================================="
-	@echo " Result: WITHOUT IBAC"
-	@echo "=============================================="
-	@echo "Evil-server logs (look for EXFILTRATED DATA RECEIVED):"
-	@echo
-	-kubectl -n $(NAMESPACE) logs deploy/ibac-evil-server --tail=20
-	@echo
-	@echo "If you see EXFILTRATED DATA RECEIVED above, the attack succeeded."
+# demo-no-ibac and demo-ibac do the same three things:
+#   1. ensure the demo is deployed
+#   2. toggle the active config
+#   3. capture a "since" timestamp, run the attack, render evidence
+#
+# The toggle target restarts the agent (rollout restart + status), so
+# by the time we hit the attack the new pod is Ready. The since
+# timestamp scopes log queries so we don't see exfil entries from a
+# previous run in the IBAC-mode evidence.
+#
+# Actual evidence rendering lives in scripts/show-evidence.sh —
+# Makefile string-quoting + indentation make multi-line bash painful.
 
-demo-ibac: ensure-deployed toggle-ibac _attack
-	@echo
-	@echo "=============================================="
-	@echo " Result: WITH IBAC"
-	@echo "=============================================="
-	@echo "Evil-server logs since last attack (should be empty for blocked attempts):"
-	@echo
-	-kubectl -n $(NAMESPACE) logs deploy/ibac-evil-server --tail=5 --since=20s
-	@echo
-	@echo "Authbridge invocations (look for ibac.blocked):"
-	@kubectl -n $(NAMESPACE) exec deploy/ibac-agent -c authbridge -- \
-	    sh -c 'wget -qO- http://localhost:9094/v1/sessions' 2>/dev/null \
-	  | head -200 || echo "(session API not reachable; try: kubectl port-forward and curl :9094/v1/sessions)"
+demo-no-ibac: ensure-deployed toggle-no-ibac
+	@SINCE=$$(date -u +%Y-%m-%dT%H:%M:%SZ); \
+	  $(MAKE) -s _attack; \
+	  bash scripts/show-evidence.sh no-ibac "$$SINCE"
+
+demo-ibac: ensure-deployed toggle-ibac
+	@SINCE=$$(date -u +%Y-%m-%dT%H:%M:%SZ); \
+	  $(MAKE) -s _attack; \
+	  bash scripts/show-evidence.sh ibac "$$SINCE"
 
 # Internal: send the attack request via a transient curl pod. We
 # can't `kubectl exec` into the agent container — its distroless
@@ -183,12 +181,13 @@ _attack:
 	@echo "=============================================="
 	@echo " Sending attack: \"Summarize my emails.\""
 	@echo "=============================================="
-	-kubectl -n $(NAMESPACE) run ibac-attacker --rm -i --restart=Never \
+	@kubectl -n $(NAMESPACE) run ibac-attacker --rm -i --restart=Never \
 	    --image=curlimages/curl:latest --quiet \
 	    --command -- curl -s -m 120 \
 	    -H "Content-Type: application/json" \
 	    -d $(ATTACK_BODY) \
-	    http://ibac-agent.$(NAMESPACE).svc.cluster.local:8080/
+	    http://ibac-agent.$(NAMESPACE).svc.cluster.local:8080/ \
+	  || echo "(attack curl failed — agent may not be ready)"
 	@echo
 
 # ---------- Diagnostics ----------
