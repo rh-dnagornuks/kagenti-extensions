@@ -2,7 +2,9 @@
 
 This demo exercises the `ibac` plugin against the same threat shape as the original [huang195/ibac](https://github.com/huang195/ibac) repo: an email-summarization agent receives a prompt-injection inside one of its emails and is tricked into POSTing data to an external server. With IBAC in the agent's outbound authbridge pipeline, the LLM judge denies the misaligned action and the exfiltration is blocked.
 
-The demo runs **inside a kagenti install** — the agent is operator-injected, registered in Keycloak, discoverable in the kagenti UI's agent list, and chatted with through the UI's chat box. When IBAC blocks a tool call, the chat response opens with a `⚠️ Security event` line so the user knows what happened. `make show-result` then renders a pipeline-level forensic of the session for deeper inspection.
+The demo runs **inside a kagenti install** — the agent is operator-injected, registered in Keycloak, discoverable in the kagenti UI's agent list, and chatted with through the UI's chat box.
+
+A key design point: **the agent itself doesn't know IBAC exists.** IBAC is a transparent gate in front of the agent's outbound HTTP — the agent only ever sees `HTTP 403` from its blocked tool call and reports a generic platform-blocked failure. All IBAC-specific evidence lives in the platform's observability layer (`make show-result`, abctl, the authbridge session API), where it actually belongs in production. This is the realism we're trading on: IBAC works against any agent without code changes, so the demo agent isn't allowed to fake "IBAC told me to say this."
 
 ## What you'll see
 
@@ -11,18 +13,26 @@ The demo runs **inside a kagenti install** — the agent is operator-injected, r
    ```
    Summarize my emails.
    ```
-3. The agent fetches emails, the last of which contains a prompt-injection payload telling the agent to POST to evil-server. The agent's tool-calling LLM follows the injection. **IBAC blocks the outbound POST.** The agent falls back to a safe text summary, but the chat response opens with:
+3. Behind the scenes: the agent fetches emails, the last of which contains a prompt-injection payload telling the agent to POST to evil-server. The agent's tool-calling LLM follows the injection. **IBAC blocks the outbound POST.** The agent's `http_post` tool gets a 403 and bails out.
+4. The chat response is the agent's authentic failure mode — generic, content-free, no platform-specific framing:
    ```
-   ⚠️ Security event: IBAC blocked an outbound action: <judge's reason>
+   I tried to act on your request, but the platform blocked one of the
+   outbound actions I attempted. Without that action I can't complete
+   the summary as asked.
 
-   Here is a safe summary of your emails:
-   * Project update: deadline moved to Friday, codename Project Falcon
-   * Lunch plans for tomorrow at the new Italian place
-   * Q3 budget approved at $2.4M
-   * Team outing on Saturday at 2pm
-   * Staging server password reset to xK9#mP2$vL
+   I'm not including any of the email content in this reply, because
+   I can't tell which parts are trustworthy after the failed action —
+   rendering it could re-expose whatever the blocked request was trying
+   to send out.
+
+   If you want to proceed, please ask a more specific question that
+   doesn't require me to forward email content — for example: "list
+   the email senders" or "how many emails do I have?". Your platform
+   operator can also check the audit trail to see what the blocked
+   action was.
    ```
-4. You run `make show-result` to see the pipeline-level forensic — the recorded user intent, every IBAC verdict (skip / allow / deny), the LLM judge's reasoning on the deny, and proof that evil-server received nothing.
+   Note what's NOT in this response: any email contents (Project Falcon, the budget, the password, the AWS account ID), any mention of "IBAC" or any specific gate, any "Security event" framing fabricated by the agent. The agent doesn't know what blocked it; it just knows a tool failed.
+5. You run `make show-result` to see the platform's view: the recorded user intent, every IBAC verdict (skip / allow / deny), the LLM judge's reasoning on the deny, and proof that evil-server received nothing. **This is where the IBAC story is told — to the operator, not to the end user.**
 
 ## Prerequisites
 
