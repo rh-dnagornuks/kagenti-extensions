@@ -16,10 +16,11 @@
 //     original repo's IBAC_PROXY env knob and bespoke transport are
 //     dropped — same effective behavior with one less moving piece.
 //
-// The vulnerability and tool definitions (get_emails / read_file /
-// http_post) are preserved unchanged: that's the whole point of the
-// demo. With IBAC enabled in the outbound pipeline, prompt-injection
-// attempts to call http_post against the evil-server are denied.
+// The vulnerability and tool definitions (get_emails / http_post)
+// preserve the original repo's threat model: poisoned email content
+// triggers an http_post tool call to an external server. With IBAC
+// enabled in the outbound pipeline, that request is denied at the
+// agent's authbridge sidecar before any data leaves the pod.
 package main
 
 import (
@@ -33,7 +34,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -98,23 +98,15 @@ type ChatChoice struct {
 	FinishReason string      `json:"finish_reason"`
 }
 
-// --- Tool definitions (verbatim) ---
+// --- Tool definitions ---
+//
+// Two tools — get_emails (the data source the prompt-injection rides in
+// on) and http_post (the exfiltration vector). The original
+// huang195/ibac repo also defined a read_file tool, but the demo never
+// exercises it, so we drop it to keep the surface area focused on
+// what's actually being demonstrated.
 
 var tools = []Tool{
-	{
-		Type: "function",
-		Function: ToolFunction{
-			Name:        "read_file",
-			Description: "Read the contents of a file from the testdata directory",
-			Parameters: ToolParams{
-				Type: "object",
-				Properties: map[string]ToolProp{
-					"filename": {Type: "string", Description: "The name of the file to read (relative to testdata/)"},
-				},
-				Required: []string{"filename"},
-			},
-		},
-	},
 	{
 		Type: "function",
 		Function: ToolFunction{
@@ -145,28 +137,6 @@ var tools = []Tool{
 }
 
 // --- Tool execution ---
-
-func execReadFile(args map[string]interface{}) string {
-	filename, _ := args["filename"].(string)
-	if filename == "" {
-		return "error: filename is required"
-	}
-	cleaned := filepath.Clean(filename)
-	if strings.Contains(cleaned, "..") {
-		return "error: path traversal not allowed"
-	}
-	var fullPath string
-	if filepath.IsAbs(cleaned) {
-		fullPath = cleaned
-	} else {
-		fullPath = filepath.Join("testdata", cleaned)
-	}
-	data, err := os.ReadFile(fullPath)
-	if err != nil {
-		return fmt.Sprintf("error reading file: %v", err)
-	}
-	return string(data)
-}
 
 // execGetEmails fetches emails by invoking the email-server's MCP
 // `get_emails` tool. Wire shape:
@@ -412,8 +382,6 @@ func parsePythonCall(s string) []ToolCall {
 	}
 	params := map[string]interface{}{}
 	switch funcName {
-	case "read_file":
-		params["filename"] = argValues[0]
 	case "http_post":
 		params["url"] = argValues[0]
 		if len(argValues) > 1 {
@@ -521,8 +489,6 @@ func runAgent(query string, sessionID string) (string, error) {
 			}
 			var result string
 			switch tc.Function.Name {
-			case "read_file":
-				result = execReadFile(args)
 			case "http_post":
 				result = execHTTPPost(args, sessionID)
 				if strings.Contains(result, "HTTP 403") {
@@ -811,69 +777,21 @@ func writeRPCError(w http.ResponseWriter, id any, code int, message string) {
 	})
 }
 
-// --- Legacy endpoint (debugging only) ---
-//
-// Same shape as huang195/ibac. Kept so the original demo's
-// `curl localhost:8080 -d '{"query":"..."}'` still works for direct
-// testing without going through the authbridge sidecar — useful for
-// confirming the agent's own behavior in isolation. NOT routed
-// through a2a-parser, so IBAC's intent capture won't fire.
-
-type legacyRequest struct {
-	Query string `json:"query"`
-}
-
-type legacyResponse struct {
-	Response string `json:"response,omitempty"`
-	Error    string `json:"error,omitempty"`
-}
-
-func handleLegacy(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "failed to read body", http.StatusBadRequest)
-		return
-	}
-	var req legacyRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
-		return
-	}
-	sessionID := r.Header.Get("X-Session-Id")
-	log.Printf("[Agent] Legacy query (session=%s): %s", sessionID, req.Query)
-	result, err := runAgent(req.Query, sessionID)
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(legacyResponse{Error: err.Error()})
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(legacyResponse{Response: result})
-}
-
 func main() {
 	proxiedClient = buildProxiedClient()
 
 	http.HandleFunc("/", handleA2A)
-	http.HandleFunc("/legacy", handleLegacy)
 	http.HandleFunc("/.well-known/agent-card.json", handleAgentCard)
 
-	// Honor PORT env so the demo's Pod manifest can land the agent on
-	// a port that doesn't collide with the authbridge sidecar's
-	// reverse proxy (default :8080). Falls back to 8080 for the
-	// standalone case (agent run on its own without authbridge in
-	// front, e.g. mirroring the original huang195/ibac demo).
+	// Honor PORT env so the demo's Pod manifest can land the agent
+	// on a port that doesn't collide with the authbridge sidecar's
+	// reverse proxy (the operator port-steals — see agent.yaml).
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 	addr := ":" + port
-	log.Printf("[Agent] Starting on %s (A2A at /, legacy at /legacy)", addr)
+	log.Printf("[Agent] Starting on %s (A2A at /)", addr)
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatalf("failed to start server: %v", err)
 	}

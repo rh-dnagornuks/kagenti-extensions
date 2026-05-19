@@ -19,8 +19,8 @@
 #   - kubectl, kind, podman/docker, python3 + PyYAML
 
 .PHONY: help build-images build-authbridge build-abctl load-images deploy \
-        patch-config wait-reload demo-ibac show-result show-result-text \
-        undeploy logs-agent logs-evil preflight wait-pods
+        patch-config wait-reload demo-ibac show-result undeploy \
+        logs-agent logs-evil preflight wait-pods
 
 # `make` with no target prints help — easier discoverability than the
 # walls-of-comments at the top.
@@ -199,9 +199,6 @@ demo-ibac: preflight deploy patch-config wait-reload  ## Deploy the demo end-to-
 
 show-result: build-abctl  ## Launch abctl against the agent's session API (interactive TUI)
 	bash scripts/launch-abctl.sh $(NAMESPACE) $(AGENT_NAME)
-
-show-result-text:  ## Print the pipeline forensic as plain text (non-interactive)
-	bash scripts/show-result.sh $(NAMESPACE) $(AGENT_NAME)
 
 # ---------- Cleanup ----------
 
