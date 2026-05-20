@@ -368,7 +368,12 @@ func shortPhase(p pipeline.SessionPhase) string {
 	case pipeline.SessionResponse:
 		return "resp"
 	case pipeline.SessionDenied:
-		return "deny"
+		// A denied event is a request that didn't reach the response
+		// phase. The terminal-deny semantics are already conveyed by
+		// the ACTION column ("deny") and STATUS column (4xx/5xx);
+		// rendering "deny" in PHASE too is duplicative. Show "req" so
+		// PHASE always communicates lifecycle position.
+		return "req"
 	}
 	return "?"
 }

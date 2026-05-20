@@ -8,12 +8,24 @@ import (
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 )
 
-// TestShortPhase_Denied locks the abctl rendering string for the
-// denied phase — changing this silently would ripple into the events
-// table and teatest snapshots.
-func TestShortPhase_Denied(t *testing.T) {
-	if got := shortPhase(pipeline.SessionDenied); got != "deny" {
-		t.Errorf("shortPhase(SessionDenied) = %q, want deny", got)
+// TestShortPhase covers the rendered string for every SessionPhase.
+// SessionDenied renders as "req" (not "deny") because the deny
+// outcome is already on the row in the ACTION + STATUS columns —
+// duplicating it in PHASE was redundant. PHASE communicates
+// lifecycle position; ACTION communicates outcome.
+func TestShortPhase(t *testing.T) {
+	cases := []struct {
+		phase pipeline.SessionPhase
+		want  string
+	}{
+		{pipeline.SessionRequest, "req"},
+		{pipeline.SessionResponse, "resp"},
+		{pipeline.SessionDenied, "req"},
+	}
+	for _, tc := range cases {
+		if got := shortPhase(tc.phase); got != tc.want {
+			t.Errorf("shortPhase(%v) = %q, want %q", tc.phase, got, tc.want)
+		}
 	}
 }
 
