@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
 	"gopkg.in/yaml.v3"
@@ -30,6 +31,12 @@ type Config struct {
 	// envoy-sidecar mode is unaffected (Envoy handles its own TLS via
 	// SDS). Pointer so absent block = today's plaintext behavior.
 	MTLS *MTLSConfig `yaml:"mtls,omitempty" json:"mtls,omitempty"`
+	// SPIFFE, when non-nil, configures the in-process Provider that
+	// supplies X.509-SVIDs to the mTLS listeners and a JWT-SVID to the
+	// token-exchange plugin (when configured). Pointer so absent block
+	// = today's spiffe-helper-driven behavior (until the chart/operator
+	// follow-ups land and start populating the block).
+	SPIFFE *SPIFFEConfig `yaml:"spiffe,omitempty" json:"spiffe,omitempty"`
 }
 
 // MTLSMode names the inbound + outbound TLS posture. Vocabulary
@@ -118,6 +125,53 @@ func (m *MTLSConfig) CheckPathsReadable() []string {
 		}
 	}
 	return missing
+}
+
+// SPIFFEConfig is the top-level SPIFFE provider configuration. One block
+// drives the in-process Provider that supplies X.509-SVIDs to the mTLS
+// listeners and a JWT-SVID to the token-exchange plugin (when configured).
+//
+// Defaults match today's spiffe-helper-driven setup so existing
+// deployments boot without changes once chart/operator follow-ups land.
+type SPIFFEConfig struct {
+	// Socket is the SPIRE agent socket URL. Defaults to
+	// "unix:///spiffe-workload-api/spire-agent.sock" — the same path
+	// spiffe-helper used to talk to.
+	Socket string `yaml:"socket" json:"socket"`
+
+	// JWTAudience is the audience for the JWT-SVID used by token-exchange
+	// as a client assertion. Required when any plugin sets
+	// tokenexchange.identity.type=spiffe (cross-block validation enforces
+	// this in Task 8); otherwise empty disables JWT-SVID fetch entirely.
+	JWTAudience string `yaml:"jwt_audience" json:"jwt_audience"`
+
+	// MirrorFiles, when true, runs an in-process goroutine that writes
+	// /opt/svid.pem, /opt/svid_key.pem, /opt/svid_bundle.pem, and
+	// /opt/jwt_svid.token on every rotation — preserving today's
+	// external-reader contract (Envoy filesystem SDS, e2e probes,
+	// debugging shells). Pointer so we can distinguish unset
+	// ("apply default true") from explicit false ("operator opted out").
+	MirrorFiles *bool `yaml:"mirror_files" json:"mirror_files"`
+
+	// MirrorDir is the directory where mirror files are written.
+	// Defaults to "/opt". Only used when MirrorFiles is true.
+	MirrorDir string `yaml:"mirror_dir" json:"mirror_dir"`
+}
+
+// Validate rejects sockets that aren't unix:// URLs. The Workload API
+// only speaks over a unix domain socket in our deployment model; a
+// tcp:// or http:// scheme is almost certainly an operator typo and
+// should fail at startup rather than at first dial. Other fields are
+// validated lazily — JWTAudience requirements are cross-block (against
+// tokenexchange.identity.type) and live in a later wiring task.
+func (s *SPIFFEConfig) Validate() error {
+	if s == nil {
+		return nil
+	}
+	if !strings.HasPrefix(s.Socket, "unix://") {
+		return fmt.Errorf("spiffe.socket must be a unix:// URL, got %q", s.Socket)
+	}
+	return nil
 }
 
 // SessionConfig controls in-memory session tracking for cross-request correlation.
@@ -358,6 +412,25 @@ func Load(path string) (*Config, error) {
 		if cfg.MTLS.BundleFile == "" {
 			cfg.MTLS.BundleFile = "/opt/svid_bundle.pem"
 		}
+	}
+
+	// SPIFFE defaults match the helper.conf-driven setup: SPIRE agent
+	// socket path, mirror-files-on, /opt mirror directory. Validation
+	// runs after defaults so an unset socket isn't reported as invalid.
+	if cfg.SPIFFE != nil {
+		if cfg.SPIFFE.Socket == "" {
+			cfg.SPIFFE.Socket = "unix:///spiffe-workload-api/spire-agent.sock"
+		}
+		if cfg.SPIFFE.MirrorFiles == nil {
+			t := true
+			cfg.SPIFFE.MirrorFiles = &t
+		}
+		if cfg.SPIFFE.MirrorDir == "" {
+			cfg.SPIFFE.MirrorDir = "/opt"
+		}
+	}
+	if err := cfg.SPIFFE.Validate(); err != nil {
+		return nil, err
 	}
 
 	return &cfg, nil

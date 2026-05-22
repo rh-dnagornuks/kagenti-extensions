@@ -681,6 +681,96 @@ func TestMTLSConfig_CheckPathsReadable(t *testing.T) {
 	})
 }
 
+// --- SPIFFE config ---
+
+// Load applies SPIFFE defaults that match today's spiffe-helper-driven
+// setup: the SPIRE agent socket path, mirror-files-on, and /opt mirror
+// directory. The common case will be `spiffe: { jwt_audience: ... }`
+// and nothing more once the chart/operator follow-ups land.
+func TestSPIFFEConfig_Defaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `mode: proxy-sidecar
+listener:
+  reverse_proxy_addr: ":8080"
+  forward_proxy_addr: ":8081"
+  reverse_proxy_backend: "http://localhost:8001"
+spiffe:
+  jwt_audience: "https://keycloak/realms/test"
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SPIFFE == nil {
+		t.Fatal("SPIFFE block missing")
+	}
+	if cfg.SPIFFE.Socket != "unix:///spiffe-workload-api/spire-agent.sock" {
+		t.Errorf("Socket = %q, want default", cfg.SPIFFE.Socket)
+	}
+	if cfg.SPIFFE.MirrorFiles == nil || !*cfg.SPIFFE.MirrorFiles {
+		t.Error("MirrorFiles should default true")
+	}
+	if cfg.SPIFFE.MirrorDir != "/opt" {
+		t.Errorf("MirrorDir = %q, want /opt", cfg.SPIFFE.MirrorDir)
+	}
+	if cfg.SPIFFE.JWTAudience != "https://keycloak/realms/test" {
+		t.Errorf("JWTAudience = %q", cfg.SPIFFE.JWTAudience)
+	}
+}
+
+// SPIFFEConfig.Validate rejects sockets that aren't unix:// URLs. The
+// Workload API only speaks over a unix domain socket in our deployment
+// model; a tcp:// or http:// scheme is almost certainly an operator
+// typo and should fail loud at startup rather than at first dial.
+func TestSPIFFEConfig_Validate_BadSocket(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `mode: proxy-sidecar
+listener:
+  reverse_proxy_addr: ":8080"
+  forward_proxy_addr: ":8081"
+  reverse_proxy_backend: "http://localhost:8001"
+spiffe:
+  socket: "tcp://oops"
+  jwt_audience: "x"
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected validation error for non-unix:// socket")
+	}
+}
+
+// A config that doesn't mention spiffe at all should still load —
+// today's deployments without the new block must keep working.
+func TestSPIFFEConfig_NotPresent_NoError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `mode: proxy-sidecar
+listener:
+  reverse_proxy_addr: ":8080"
+  forward_proxy_addr: ":8081"
+  reverse_proxy_backend: "http://localhost:8001"
+mtls:
+  mode: permissive
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SPIFFE != nil {
+		t.Errorf("SPIFFE should be nil when block not present, got %+v", cfg.SPIFFE)
+	}
+}
+
 // Absent mtls block leaves cfg.MTLS nil — today's behavior, no TLS.
 func TestLoad_MTLS_AbsentBlock(t *testing.T) {
 	dir := t.TempDir()
