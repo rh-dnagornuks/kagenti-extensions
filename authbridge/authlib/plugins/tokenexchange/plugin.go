@@ -18,6 +18,7 @@ import (
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins/tokenexchange/cache"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins/tokenexchange/exchange"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/routing"
+	fwspiffe "github.com/kagenti/kagenti-extensions/authbridge/authlib/spiffe"
 )
 
 // tokenExchangeConfig is the plugin's local config schema. See
@@ -199,6 +200,40 @@ type TokenExchange struct {
 	// auth.Auth.Ready() checks Identity.Audiences which token-exchange
 	// doesn't set (it uses ClientID), so we track readiness locally.
 	ready atomic.Bool
+
+	// provider is the framework SPIFFE provider injected via
+	// SetSPIFFEProvider before Configure runs (see plugins.BuildWithSPIFFE).
+	// Nil when SPIRE is disabled or no provider was wired in. Used by
+	// Configure / pollCredentials when identity.type=spiffe to obtain a
+	// JWTSource for client-assertion JWTs.
+	provider *fwspiffe.Provider
+
+	// testJWTSource is a test-only override that bypasses provider. Used
+	// by package-internal tests to exercise the spiffe identity wiring
+	// without spinning up a real SPIRE socket. nil in production.
+	testJWTSource fwspiffe.JWTSource
+}
+
+// SetSPIFFEProvider implements fwspiffe.ProviderConsumer. The framework's
+// plugins.BuildWithSPIFFE calls this before Configure runs. The Provider
+// is consulted by Configure / pollCredentials when identity.type=spiffe;
+// other identity types ignore it.
+func (p *TokenExchange) SetSPIFFEProvider(prov *fwspiffe.Provider) {
+	p.provider = prov
+}
+
+// jwtSource returns the framework JWTSource to use for spiffe identity:
+// testJWTSource (test-only) overrides; otherwise provider.JWTSource()
+// (which itself may be nil if the provider was constructed without a
+// JWTAudience). Returns nil when neither is available.
+func (p *TokenExchange) jwtSource() fwspiffe.JWTSource {
+	if p.testJWTSource != nil {
+		return p.testJWTSource
+	}
+	if p.provider != nil {
+		return p.provider.JWTSource()
+	}
+	return nil
 }
 
 // NewTokenExchange constructs an unconfigured plugin.
@@ -272,8 +307,9 @@ func (p *TokenExchange) Configure(raw json.RawMessage) error {
 		}
 	}
 
+	jwtSrc := p.jwtSource()
 	clientAuth, err := buildClientAuthFrom(c.Identity.Type,
-		c.Identity.ClientID, c.Identity.ClientSecret)
+		c.Identity.ClientID, c.Identity.ClientSecret, jwtSrc)
 	if err != nil {
 		return fmt.Errorf("token-exchange: %w", err)
 	}
@@ -303,12 +339,11 @@ func (p *TokenExchange) Configure(raw json.RawMessage) error {
 	p.inner = auth.New(authCfg)
 
 	// Readiness: the synchronous credential load in Configure may have
-	// populated ClientID already. For SPIFFE identity we also need the
-	// SVID path to exist on disk (spiffe-helper has to have written it);
-	// the jwt-svid source re-reads on each exchange, so existence at
-	// this moment is a reasonable proxy. If the poll path is going to
-	// run, ready stays false until pollCredentials flips it.
-	if credentialsAreReady(c.Identity) {
+	// populated ClientID already. For SPIFFE identity we also need a
+	// JWTSource from the injected Provider; the source itself caches
+	// and refreshes the SVID transparently. If the poll path is going
+	// to run, ready stays false until pollCredentials flips it.
+	if credentialsAreReady(c.Identity, jwtSrc) {
 		p.ready.Store(true)
 	}
 	return nil
@@ -317,7 +352,7 @@ func (p *TokenExchange) Configure(raw json.RawMessage) error {
 // credentialsAreReady returns true iff the identity has everything it
 // needs to do an exchange right now. Keeping this as a pure function
 // lets pollCredentials and Configure share the predicate.
-func credentialsAreReady(id tokenExchangeIdentity) bool {
+func credentialsAreReady(id tokenExchangeIdentity, jwtSrc fwspiffe.JWTSource) bool {
 	if id.ClientID == "" {
 		return false
 	}
@@ -325,9 +360,10 @@ func credentialsAreReady(id tokenExchangeIdentity) bool {
 	case "client-secret":
 		return id.ClientSecret != ""
 	case "spiffe":
-		// JWT-SVID source reads the file lazily; existence of ClientID
-		// is the signal that the operator's Secret mount has completed.
-		return true
+		// SPIFFE identity is ready iff a JWTSource was injected (via the
+		// framework Provider) and the operator's Secret mount has
+		// supplied the client_id.
+		return jwtSrc != nil
 	}
 	return false
 }
@@ -338,20 +374,22 @@ func credentialsAreReady(id tokenExchangeIdentity) bool {
 // from goroutine locals, not from the immutable p.cfg). Pure function
 // — no reads from the receiver.
 //
-// The "spiffe" identity path panics for now: T11 wires the framework
-// spiffe.Provider via SetSPIFFEProvider on the TokenExchange plugin, at
-// which point this function takes a JWTSource arg from the caller. The
-// existing test suite avoids this code path by using client-secret
-// identity; configs that set identity.type=spiffe are caught earlier by
-// the cross-block Validate (config.Validate enforces that
-// spiffe.jwt_audience is set, which only matters once the Provider is
-// actually wired).
-func buildClientAuthFrom(identityType, clientID, clientSecret string) (exchange.ClientAuth, error) {
+// The "spiffe" identity path requires a non-nil JWTSource — supplied by
+// the framework spiffe.Provider via SetSPIFFEProvider (see
+// plugins.BuildWithSPIFFE). When the provider hasn't been wired in (or
+// was constructed without a JWTAudience), this returns an explicit
+// configuration error rather than panicking.
+func buildClientAuthFrom(identityType, clientID, clientSecret string, jwtSrc fwspiffe.JWTSource) (exchange.ClientAuth, error) {
 	switch identityType {
 	case "spiffe":
-		// T11 will replace this panic with the injected JWTSource path.
-		// Until then, the spiffe identity branch is intentionally unwired.
-		panic("tokenexchange: spiffe identity requires SPIFFE provider injection (see plan task T11)")
+		if jwtSrc == nil {
+			return nil, errors.New("spiffe identity requires SPIFFE provider with non-empty jwt_audience to be injected")
+		}
+		return &exchange.JWTAssertionAuth{
+			ClientID:      clientID,
+			AssertionType: "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe",
+			TokenSource:   jwtSrc.FetchToken,
+		}, nil
 	case "client-secret":
 		return &exchange.ClientSecretAuth{
 			ClientID:     clientID,
@@ -439,7 +477,7 @@ func (p *TokenExchange) pollCredentials(ctx context.Context, needID, needSecret 
 		}
 		clientSecret = v
 	}
-	clientAuth, err := buildClientAuthFrom(p.cfg.Identity.Type, clientID, clientSecret)
+	clientAuth, err := buildClientAuthFrom(p.cfg.Identity.Type, clientID, clientSecret, p.jwtSource())
 	if err != nil {
 		slog.Warn("token-exchange: failed to rebuild client auth after credential load", "error", err)
 		return
@@ -577,9 +615,10 @@ func (p *TokenExchange) Stats() *auth.Stats {
 
 // Compile-time interface checks.
 var (
-	_ pipeline.Configurable = (*TokenExchange)(nil)
-	_ pipeline.Initializer  = (*TokenExchange)(nil)
-	_ pipeline.Shutdowner   = (*TokenExchange)(nil)
-	_ pipeline.Readier      = (*TokenExchange)(nil)
-	_ plugins.StatsSource   = (*TokenExchange)(nil)
+	_ pipeline.Configurable     = (*TokenExchange)(nil)
+	_ pipeline.Initializer      = (*TokenExchange)(nil)
+	_ pipeline.Shutdowner       = (*TokenExchange)(nil)
+	_ pipeline.Readier          = (*TokenExchange)(nil)
+	_ plugins.StatsSource       = (*TokenExchange)(nil)
+	_ fwspiffe.ProviderConsumer = (*TokenExchange)(nil)
 )

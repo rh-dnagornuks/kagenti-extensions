@@ -3,14 +3,31 @@ package tokenexchange
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/pipeline"
+	fwspiffe "github.com/kagenti/kagenti-extensions/authbridge/authlib/spiffe"
 )
+
+// fakeJWTSource is a minimal fwspiffe.JWTSource for unit-testing the
+// SPIFFE identity wiring without spinning up a real SPIRE socket.
+type fakeJWTSource struct {
+	token string
+	err   error
+}
+
+func (f *fakeJWTSource) FetchToken(_ context.Context) (string, error) {
+	return f.token, f.err
+}
+
+// setJWTSourceForTest installs a fake JWTSource on the plugin, bypassing
+// the SPIFFE Provider. Lives in the test file so the production API
+// surface stays clean. Use only from tests in this package.
+func (p *TokenExchange) setJWTSourceForTest(j fwspiffe.JWTSource) {
+	p.testJWTSource = j
+}
 
 func invokeOnRequest(p pipeline.Plugin, pctx *pipeline.Context) pipeline.Action {
 	pctx.SetCurrentPlugin(p.Name(), pipeline.InvocationPhaseRequest)
@@ -45,33 +62,15 @@ func TestTokenExchange_Configure_DerivesTokenURL(t *testing.T) {
 
 func TestTokenExchange_Configure_DefaultIdentityPaths_SPIFFE(t *testing.T) {
 	// T8 dropped the per-plugin jwt_svid_path field; the JWTSource is
-	// supplied by the framework SPIFFE provider (T11). Configure on a
-	// spiffe-typed plugin still applies the client_id_file default
-	// without panicking — buildClientAuthFrom only panics when an
-	// actual exchange is attempted, which Configure does not do.
+	// supplied by the framework SPIFFE provider (T11). With T11's wiring
+	// in place, Configure on a spiffe-typed plugin succeeds when a
+	// JWTSource is injected, and the client_id_file default is applied.
 	p := NewTokenExchange()
+	p.setJWTSourceForTest(&fakeJWTSource{token: "test-jwt"})
 	raw := []byte(`{
 	  "token_url":"http://t",
 	  "identity":{"type":"spiffe"}
 	}`)
-	defer func() {
-		// T11 will remove this recover. For now the spiffe identity
-		// path panics inside buildClientAuthFrom during Configure;
-		// catch ONLY the expected panic so a future unrelated panic on
-		// this code path fails the test loud instead of silently skipping.
-		// Once T11 lands and removes the panic, recover() returns nil and
-		// the test body runs to completion normally.
-		r := recover()
-		if r == nil {
-			return
-		}
-		msg := fmt.Sprint(r)
-		if !strings.Contains(msg, "plan task T11") &&
-			!strings.Contains(msg, "SPIFFE provider injection") {
-			t.Fatalf("unexpected panic: %v", r)
-		}
-		t.Skip("spiffe identity Configure path panics until T11 wires SPIFFE provider injection")
-	}()
 	if err := p.Configure(raw); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
@@ -347,5 +346,36 @@ func TestTokenExchange_NoToken_Deny(t *testing.T) {
 	status, _, _ := action.Violation.Render()
 	if status != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", status)
+	}
+}
+
+// --- SPIFFE provider injection (T11) ---
+
+func TestTokenExchange_SPIFFE_Identity_UsesInjectedJWTSource(t *testing.T) {
+	p := NewTokenExchange()
+	p.setJWTSourceForTest(&fakeJWTSource{token: "test-jwt"})
+
+	raw := []byte(`{
+	  "token_url":"http://example/token",
+	  "identity":{"type":"spiffe","client_id":"agent-1"}
+	}`)
+	if err := p.Configure(raw); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if !p.Ready() {
+		t.Error("expected Ready=true after spiffe Configure with injected JWTSource")
+	}
+}
+
+func TestTokenExchange_SPIFFE_Identity_ErrorsWhenNoJWTSource(t *testing.T) {
+	p := NewTokenExchange()
+	// No SetSPIFFEProvider, no setJWTSourceForTest — Configure must
+	// fail rather than panic on the spiffe identity path.
+	raw := []byte(`{
+	  "token_url":"http://example/token",
+	  "identity":{"type":"spiffe","client_id":"agent-1"}
+	}`)
+	if err := p.Configure(raw); err == nil {
+		t.Fatal("expected error when spiffe identity has no JWTSource, got nil")
 	}
 }
