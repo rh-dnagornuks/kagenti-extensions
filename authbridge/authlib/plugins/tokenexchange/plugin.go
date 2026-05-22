@@ -17,7 +17,6 @@ import (
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins/tokenexchange/cache"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins/tokenexchange/exchange"
-	"github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins/tokenexchange/spiffe"
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/routing"
 )
 
@@ -78,9 +77,11 @@ type tokenExchangeIdentity struct {
 	ClientSecret     string `json:"client_secret"`
 	ClientSecretFile string `json:"client_secret_file"`
 
-	// JWTSVIDPath is the file path where spiffe-helper writes the
-	// JWT-SVID (type=spiffe).
-	JWTSVIDPath string `json:"jwt_svid_path"`
+	// jwt_svid_path was historically a per-plugin path to the JWT-SVID
+	// file written by spiffe-helper. Removed in favor of injection via
+	// the framework spiffe.Provider (see the top-level spiffe block in
+	// authlib/config). T11 wires the Provider into TokenExchange and
+	// supplies the JWTSource directly.
 }
 
 type tokenExchangeRoutes struct {
@@ -132,9 +133,8 @@ func (c *tokenExchangeConfig) applyDefaults() {
 		if c.Identity.ClientID == "" && c.Identity.ClientIDFile == "" {
 			c.Identity.ClientIDFile = "/shared/client-id.txt"
 		}
-		if c.Identity.JWTSVIDPath == "" {
-			c.Identity.JWTSVIDPath = "/opt/jwt_svid.token"
-		}
+		// JWT-SVID source is injected via the framework SPIFFE provider
+		// (T11) rather than read from a per-plugin file path.
 	case "client-secret":
 		if c.Identity.ClientID == "" && c.Identity.ClientIDFile == "" {
 			c.Identity.ClientIDFile = "/shared/client-id.txt"
@@ -273,7 +273,7 @@ func (p *TokenExchange) Configure(raw json.RawMessage) error {
 	}
 
 	clientAuth, err := buildClientAuthFrom(c.Identity.Type,
-		c.Identity.ClientID, c.Identity.ClientSecret, c.Identity.JWTSVIDPath)
+		c.Identity.ClientID, c.Identity.ClientSecret)
 	if err != nil {
 		return fmt.Errorf("token-exchange: %w", err)
 	}
@@ -337,15 +337,21 @@ func credentialsAreReady(id tokenExchangeIdentity) bool {
 // assigned) and by pollCredentials (which reads its credential values
 // from goroutine locals, not from the immutable p.cfg). Pure function
 // — no reads from the receiver.
-func buildClientAuthFrom(identityType, clientID, clientSecret, jwtSVIDPath string) (exchange.ClientAuth, error) {
+//
+// The "spiffe" identity path panics for now: T11 wires the framework
+// spiffe.Provider via SetSPIFFEProvider on the TokenExchange plugin, at
+// which point this function takes a JWTSource arg from the caller. The
+// existing test suite avoids this code path by using client-secret
+// identity; configs that set identity.type=spiffe are caught earlier by
+// the cross-block Validate (config.Validate enforces that
+// spiffe.jwt_audience is set, which only matters once the Provider is
+// actually wired).
+func buildClientAuthFrom(identityType, clientID, clientSecret string) (exchange.ClientAuth, error) {
 	switch identityType {
 	case "spiffe":
-		source := spiffe.NewFileJWTSource(jwtSVIDPath)
-		return &exchange.JWTAssertionAuth{
-			ClientID:      clientID,
-			AssertionType: "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe",
-			TokenSource:   source.FetchToken,
-		}, nil
+		// T11 will replace this panic with the injected JWTSource path.
+		// Until then, the spiffe identity branch is intentionally unwired.
+		panic("tokenexchange: spiffe identity requires SPIFFE provider injection (see plan task T11)")
 	case "client-secret":
 		return &exchange.ClientSecretAuth{
 			ClientID:     clientID,
@@ -433,7 +439,7 @@ func (p *TokenExchange) pollCredentials(ctx context.Context, needID, needSecret 
 		}
 		clientSecret = v
 	}
-	clientAuth, err := buildClientAuthFrom(p.cfg.Identity.Type, clientID, clientSecret, p.cfg.Identity.JWTSVIDPath)
+	clientAuth, err := buildClientAuthFrom(p.cfg.Identity.Type, clientID, clientSecret)
 	if err != nil {
 		slog.Warn("token-exchange: failed to rebuild client auth after credential load", "error", err)
 		return

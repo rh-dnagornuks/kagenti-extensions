@@ -765,3 +765,124 @@ listener:
 		t.Errorf("MTLS = %+v, want nil (absent block)", cfg.MTLS)
 	}
 }
+
+// --- Cross-block validation ---
+
+// A token-exchange plugin with identity.type=spiffe requires a
+// top-level spiffe.jwt_audience to be set. The audience for the
+// JWT-SVID used as a client assertion lives on the framework spiffe
+// block (T6) — token-exchange no longer carries its own audience or
+// jwt_svid_path. Validate must catch the missing audience at startup
+// rather than letting the framework Provider boot with no audience and
+// have token exchanges fail at runtime with a confusing error.
+func TestValidate_SpiffeIdentity_RequiresAudience(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `mode: proxy-sidecar
+listener:
+  reverse_proxy_addr: ":8080"
+  forward_proxy_addr: ":8081"
+  reverse_proxy_backend: "http://localhost:8001"
+pipeline:
+  inbound:
+    plugins:
+      - jwt-validation
+  outbound:
+    plugins:
+      - name: token-exchange
+        config:
+          token_url: "http://keycloak/realms/kagenti/protocol/openid-connect/token"
+          identity:
+            type: spiffe
+spiffe:
+  socket: "unix:///spire/socket"
+  # jwt_audience missing
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	err = Validate(cfg)
+	if err == nil {
+		t.Fatal("expected validation error: spiffe identity requires spiffe.jwt_audience")
+	}
+	if !strings.Contains(err.Error(), "jwt_audience") {
+		t.Errorf("error = %v, want mention of jwt_audience", err)
+	}
+}
+
+// Same shape but with jwt_audience set — Validate should accept it.
+func TestValidate_SpiffeIdentity_AudiencePresent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `mode: proxy-sidecar
+listener:
+  reverse_proxy_addr: ":8080"
+  forward_proxy_addr: ":8081"
+  reverse_proxy_backend: "http://localhost:8001"
+pipeline:
+  inbound:
+    plugins:
+      - jwt-validation
+  outbound:
+    plugins:
+      - name: token-exchange
+        config:
+          token_url: "http://keycloak/realms/kagenti/protocol/openid-connect/token"
+          identity:
+            type: spiffe
+spiffe:
+  socket: "unix:///spire/socket"
+  jwt_audience: "keycloak"
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+// client-secret identity is unaffected by the spiffe.jwt_audience
+// requirement. Configs that don't use the spiffe identity path don't
+// need a SPIFFE block at all.
+func TestValidate_ClientSecretIdentity_NoSpiffeNeeded(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := `mode: proxy-sidecar
+listener:
+  reverse_proxy_addr: ":8080"
+  forward_proxy_addr: ":8081"
+  reverse_proxy_backend: "http://localhost:8001"
+pipeline:
+  inbound:
+    plugins:
+      - jwt-validation
+  outbound:
+    plugins:
+      - name: token-exchange
+        config:
+          token_url: "http://keycloak/realms/kagenti/protocol/openid-connect/token"
+          identity:
+            type: client-secret
+            client_id: c
+            client_secret: s
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
