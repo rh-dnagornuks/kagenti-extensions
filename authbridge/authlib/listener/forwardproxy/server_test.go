@@ -107,7 +107,10 @@ func TestForwardProxy_Exchange(t *testing.T) {
 func TestForwardProxy_CONNECT_TunnelsBytes(t *testing.T) {
 	// Bare TCP echo — stand-in for any TLS server. We only need to
 	// prove that bytes the agent writes reach the upstream and bytes
-	// the upstream writes reach the agent.
+	// the upstream writes reach the agent. Loop until the client
+	// closes so we can exercise multiple round-trips, which is closer
+	// to what a real TLS handshake (multi-roundtrip, interleaved
+	// reads and writes) does over the tunnel.
 	upstream, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen upstream: %v", err)
@@ -119,13 +122,16 @@ func TestForwardProxy_CONNECT_TunnelsBytes(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		// Echo back exactly what we receive, prefixed with "echo:".
 		buf := make([]byte, 1024)
-		n, err := conn.Read(buf)
-		if err != nil {
-			return
+		for {
+			n, err := conn.Read(buf)
+			if err != nil {
+				return
+			}
+			if _, err := conn.Write(append([]byte("echo:"), buf[:n]...)); err != nil {
+				return
+			}
 		}
-		_, _ = conn.Write(append([]byte("echo:"), buf[:n]...))
 	}()
 
 	a := auth.New(auth.Config{})
@@ -171,18 +177,24 @@ func TestForwardProxy_CONNECT_TunnelsBytes(t *testing.T) {
 		}
 	}
 
-	// Tunnel is up. Send a payload and expect the echo prefix back.
-	if _, err := tunnel.Write([]byte("hello")); err != nil {
-		t.Fatalf("write through tunnel: %v", err)
-	}
-	got := make([]byte, 32)
-	_ = tunnel.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, err := br.Read(got)
-	if err != nil && err != io.EOF {
-		t.Fatalf("read through tunnel: %v", err)
-	}
-	if string(got[:n]) != "echo:hello" {
-		t.Errorf("tunnel response = %q, want %q", got[:n], "echo:hello")
+	// Tunnel is up. Drive multiple round-trips to model the multi-RTT
+	// nature of a real TLS handshake. A single write/read would catch
+	// basic plumbing but miss half-duplex regressions in the
+	// bidirectional copy.
+	for _, payload := range []string{"hello", "world", "third"} {
+		if _, err := tunnel.Write([]byte(payload)); err != nil {
+			t.Fatalf("write %q through tunnel: %v", payload, err)
+		}
+		got := make([]byte, 32)
+		_ = tunnel.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, err := br.Read(got)
+		if err != nil && err != io.EOF {
+			t.Fatalf("read %q response: %v", payload, err)
+		}
+		want := "echo:" + payload
+		if string(got[:n]) != want {
+			t.Errorf("tunnel response for %q = %q, want %q", payload, got[:n], want)
+		}
 	}
 }
 

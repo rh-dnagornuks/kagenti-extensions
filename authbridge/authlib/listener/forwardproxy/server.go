@@ -452,11 +452,12 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Hijack BEFORE dialing upstream — if hijacking isn't supported
-	// the failure mode should be a 500 to the client, not a half-opened
-	// TCP connection to the upstream.
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
+	// Verify hijack capability BEFORE dialing upstream. If hijacking
+	// isn't supported the failure mode should be a 500 to the client,
+	// not a half-opened TCP connection to the upstream. The actual
+	// Hijack() call happens after dial succeeds — http.Error needs an
+	// un-hijacked ResponseWriter to deliver the dial-failure 502.
+	if _, ok := w.(http.Hijacker); !ok {
 		slog.Error("forward-proxy: ResponseWriter does not support hijacking", "host", r.Host)
 		http.Error(w, `{"error":"connect not supported by listener"}`, http.StatusInternalServerError)
 		return
@@ -471,12 +472,21 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientConn, _, err := hijacker.Hijack()
+	clientConn, _, err := w.(http.Hijacker).Hijack()
 	if err != nil {
 		_ = upstream.Close()
 		slog.Error("forward-proxy: CONNECT hijack failed", "host", r.Host, "error", err)
 		return
 	}
+
+	// TCP keepalive on both ends. Streaming LLM completions can hold
+	// the tunnel open for minutes; without keepalives, a vanished peer
+	// (network partition, NAT entry expiry, peer reboot) parks the
+	// io.Copy goroutines until the OS finally times the socket out.
+	// 30s is loose enough to not perturb idle traffic and tight enough
+	// that operators get prompt cleanup on dead connections.
+	enableKeepalive(upstream)
+	enableKeepalive(clientConn)
 
 	// Tell the agent the tunnel is up. Per RFC 7231 §4.3.6 a 200 to
 	// CONNECT signals "tunnel established"; the body is empty and any
@@ -486,6 +496,32 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		_ = upstream.Close()
 		slog.Debug("forward-proxy: CONNECT 200 write failed", "host", r.Host, "error", err)
 		return
+	}
+
+	// Record a SessionRequest event so /v1/sessions and abctl show that
+	// a tunnel was opened. Mirrors the HTTP path's post-Allow recording
+	// (see handleRequest above). The MCP / Inference snapshots are nil
+	// by definition (CONNECT bytes are opaque), but Invocations from
+	// gate plugins (ibac, token-exchange's skip/no_route, etc.) and
+	// any plugin-public Plugins entries are still meaningful.
+	if s.Sessions != nil {
+		sid := s.Sessions.ActiveSession()
+		if sid == "" {
+			sid = session.DefaultSessionID
+		}
+		plugins := pipeline.SnapshotPlugins(pctx.Extensions.Custom)
+		ev := pipeline.SessionEvent{
+			At:          time.Now(),
+			Direction:   pipeline.Outbound,
+			Phase:       pipeline.SessionRequest,
+			Invocations: pipeline.SnapshotInvocations(pctx.Extensions.Invocations, pipeline.InvocationPhaseRequest),
+			Plugins:     plugins,
+			Identity:    pipeline.SnapshotIdentity(pctx),
+			Host:        pctx.Host,
+		}
+		if ev.Invocations != nil || plugins != nil {
+			s.Sessions.Append(sid, ev)
+		}
 	}
 
 	// Bidirectional copy. When either side closes, propagate the close
@@ -499,4 +535,17 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(clientConn, upstream)
 	_ = clientConn.Close()
 	_ = upstream.Close()
+}
+
+// enableKeepalive turns on TCP keepalive with a 30s probe interval on
+// the underlying *net.TCPConn, if conn unwraps to one. No-op on other
+// connection types (notably *tls.Conn, which doesn't apply on the
+// CONNECT path since the bytes through the tunnel are already TLS).
+func enableKeepalive(conn net.Conn) {
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tcp.SetKeepAlive(true)
+	_ = tcp.SetKeepAlivePeriod(30 * time.Second)
 }
