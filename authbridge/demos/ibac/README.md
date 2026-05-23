@@ -179,13 +179,13 @@ cat k8s/ibac-patch.yaml
 
 The script does an idempotent merge — re-running after a fix is safe.
 
-### Hot-reload doesn't fire — `wait-reload` times out
+### Hot-reload doesn't fire — `patch-config` times out waiting for the reload
 
-The script tails the authbridge container for `reloader: pipelines swapped`. Failure modes:
+After applying a real change to the ConfigMap, `patch-config` tails the authbridge container for `reloader: pipelines swapped`. (No-op patches — typical on a re-run where the CM is already current — short-circuit and don't wait.) Failure modes:
 
 - **Bad config**: the merged config.yaml is invalid. Look in the authbridge logs for `reload failed`.
-- **Slow kubelet sync**: the projected ConfigMap volume can take up to ~60s to propagate. Bump the timeout: `bash scripts/wait-for-reload.sh team1 email-agent 180`.
-- **Operator overwrote the patch**: rare — happens if the operator's reconciler kicks. Re-run `make patch-config && make wait-reload`.
+- **Slow kubelet sync**: the projected ConfigMap volume can take up to ~60s to propagate. Bump the timeout: `RELOAD_TIMEOUT=180 make patch-config`.
+- **Operator overwrote the patch**: rare — happens if the operator's reconciler kicks. Re-run `make patch-config`.
 
 ### Kagenti UI shows "Agent card not available"
 
@@ -212,7 +212,7 @@ This shouldn't happen. Check the active config:
 kubectl -n team1 get cm authbridge-config-email-agent -o jsonpath='{.data.config\.yaml}' | grep ibac
 ```
 
-If `ibac` isn't there, the patch silently failed. Re-run `make patch-config && make wait-reload`.
+If `ibac` isn't there, the patch silently failed. Re-run `make patch-config`.
 
 ### `make show-result` reports `ATTACK MISFIRED`
 

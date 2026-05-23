@@ -17,7 +17,7 @@
 #   - kubectl, kind, podman/docker, python3 + PyYAML
 
 .PHONY: help build-images build-abctl load-images deploy \
-        patch-config wait-reload demo-ibac show-result undeploy \
+        patch-config demo-ibac show-result undeploy \
         logs-agent logs-evil preflight wait-pods
 
 # `make` with no target prints help — easier discoverability than the
@@ -135,15 +135,12 @@ wait-pods:  ## Wait for pods + operator-rendered authbridge ConfigMap
 	  exit 1; \
 	}
 
-patch-config:  ## Add a2a-parser + ibac to the rendered authbridge ConfigMap
+patch-config:  ## Add a2a-parser + ibac to the rendered authbridge ConfigMap (and wait for hot-reload)
 	bash scripts/patch-ibac-config.sh $(NAMESPACE) $(AGENT_NAME)
-
-wait-reload:  ## Wait for the sidecar's hot-reload to pick up the patched config
-	bash scripts/wait-for-reload.sh $(NAMESPACE) $(AGENT_NAME) 120
 
 # ---------- Top-level demo + result rendering ----------
 
-demo-ibac: preflight build-images load-images deploy patch-config wait-reload  ## Build, load, deploy the demo end-to-end and print next-steps banner
+demo-ibac: preflight build-images load-images deploy patch-config  ## Build, load, deploy the demo end-to-end and print next-steps banner
 	@echo
 	@echo "╔══════════════════════════════════════════════════════════╗"
 	@echo "║ ✅ IBAC demo agent ready in $(NAMESPACE)                          ║"

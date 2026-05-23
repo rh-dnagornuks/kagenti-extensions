@@ -17,7 +17,10 @@
 #
 # Authbridge's filesystem-watch hot-reload picks up the change without
 # a Pod restart (the operator-injected sidecar doesn't set
-# readOnlyRootFilesystem so fsnotify can see the symlink swap).
+# readOnlyRootFilesystem so fsnotify can see the symlink swap). On a
+# re-run where the CM is already patched (e.g. previous demo run +
+# fresh rollout-restart that booted with the patched content), the
+# script short-circuits — no apply, no reload-wait.
 
 set -euo pipefail
 
@@ -55,15 +58,37 @@ fi
 # because heredoc + piped stdin clash — python3 with `<<EOF` reads
 # its script from the heredoc, which silently drops the kubectl pipe.
 echo "[*] Merging IBAC additions into $CM_NAME ..."
-MERGED_YAML=$(
+CURRENT_YAML=$(
   kubectl -n "$NAMESPACE" get configmap "$CM_NAME" \
-      -o jsonpath='{.data.config\.yaml}' \
+      -o jsonpath='{.data.config\.yaml}'
+)
+MERGED_YAML=$(
+  printf '%s' "$CURRENT_YAML" \
     | python3 "$SCRIPT_DIR/ibac-merge.py" "$PATCH_FILE"
 )
 
 if [[ -z "$MERGED_YAML" ]]; then
   echo "ERROR: merge produced empty output" >&2
   exit 1
+fi
+
+# No-op short-circuit: if the patch wouldn't change anything (typical
+# on a re-run where a previous demo invocation already patched the CM
+# and the agent pod booted with that content baked in), skip the apply
+# AND skip the reload wait. Otherwise we block forever waiting for a
+# swap event that will never fire — kubectl apply is a no-op, kubelet
+# has nothing to sync, the reloader sees no fs event.
+if [[ "$CURRENT_YAML" == "$MERGED_YAML" ]]; then
+  echo "[*] $CM_NAME already contains IBAC config — nothing to patch."
+  echo "[*] Active plugins:"
+  printf '%s' "$CURRENT_YAML" | python3 -c '
+import yaml, sys
+c = yaml.safe_load(sys.stdin)
+for d in ("inbound", "outbound"):
+    names = [p["name"] for p in c.get("pipeline", {}).get(d, {}).get("plugins", [])]
+    print(f"      {d}: {names}")
+'
+  exit 0
 fi
 
 # Apply the patched ConfigMap. Using `kubectl create configmap
@@ -90,3 +115,32 @@ for d in ("inbound", "outbound"):
     names = [p["name"] for p in c.get("pipeline", {}).get(d, {}).get("plugins", [])]
     print(f"      {d}: {names}")
 '
+
+# Block until the sidecar's filesystem watcher picks up the new
+# ConfigMap content and swaps pipelines. kubelet syncs projected
+# volumes on roughly a 60s cycle, so the reload typically lands in
+# 5-90s. Only runs when we actually changed the CM (above no-op
+# short-circuit handles re-runs).
+TIMEOUT=${RELOAD_TIMEOUT:-120}
+DEADLINE=$(( $(date +%s) + TIMEOUT ))
+SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+echo "[*] Waiting for authbridge to hot-reload (timeout ${TIMEOUT}s) ..."
+while [[ $(date +%s) -lt $DEADLINE ]]; do
+  if kubectl -n "$NAMESPACE" logs deploy/"$AGENT_NAME" -c authbridge-proxy \
+        --since-time="$SINCE" 2>/dev/null \
+        | grep -F "reloader: pipelines swapped" >/dev/null; then
+    echo "[*] Reload confirmed."
+    exit 0
+  fi
+  sleep 3
+done
+
+echo "ERROR: authbridge did not log 'reloader: pipelines swapped' within ${TIMEOUT}s." >&2
+echo "       Last 20 lines of the authbridge container:" >&2
+kubectl -n "$NAMESPACE" logs deploy/"$AGENT_NAME" -c authbridge-proxy --tail=20 >&2 || true
+echo >&2
+echo "       Likely causes:" >&2
+echo "         - ConfigMap parse error (check 'reload failed' lines above)" >&2
+echo "         - kubelet hasn't synced the projected volume yet (re-run patch-config)" >&2
+echo "         - operator restarted and overwrote your patch (re-run patch-config)" >&2
+exit 1
