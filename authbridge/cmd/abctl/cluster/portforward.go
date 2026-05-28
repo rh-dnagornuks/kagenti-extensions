@@ -56,16 +56,19 @@ type PortForwarder interface {
 	Start(ctx context.Context, namespace, pod string) (PortForward, error)
 }
 
-// PortForward is a live tunnel to a pod. The caller MUST Close it.
+// PortForward is a live tunnel to a pod. The caller MUST Close it
+// exactly once. Wait and Close are mutually exclusive — call one,
+// not both.
 type PortForward interface {
 	// Endpoint is the URL abctl points its apiclient at.
 	Endpoint() string
 	// LocalPort is the ephemeral 127.0.0.1 port the tunnel listens on.
 	LocalPort() int
 	// Wait blocks until the underlying tunnel exits and returns the exit
-	// error (nil on graceful Close).
+	// error (nil on graceful Close). Mutually exclusive with Close.
 	Wait() error
-	// Close terminates the tunnel.
+	// Close terminates the tunnel and waits for it to exit. Safe to
+	// call once. Mutually exclusive with Wait.
 	Close() error
 }
 
@@ -142,6 +145,11 @@ func (p *kubectlPortForward) Close() error {
 	_ = p.cmd.Process.Kill()
 	// Wait so the OS reaps the child; ignore exit error (Kill produces one).
 	_ = p.cmd.Wait()
+	// Wait for the stderr-drain goroutine to flush its last lines before
+	// returning, so callers can safely read stderrTail() afterwards.
+	if p.stderrDone != nil {
+		<-p.stderrDone
+	}
 	return nil
 }
 
@@ -151,6 +159,9 @@ func (p *kubectlPortForward) startStderrDrain() {
 	p.stderrDone = make(chan struct{})
 	go func() {
 		defer close(p.stderrDone)
+		// Read in chunks and split on newlines. Lines may be split at read
+		// boundaries — acceptable for best-effort error context (the 16-line
+		// cap and " | " join keep any garbling bounded).
 		buf := make([]byte, 4096)
 		for {
 			n, err := p.stderr.Read(buf)
