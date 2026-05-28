@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,7 +48,7 @@ func TestNamespacesPaneLoadsAndRenders(t *testing.T) {
 		t.Fatalf("model should hold 2 namespaces, got %d", len(mm.namespaces))
 	}
 	view := mm.View()
-	if !contains(view, "team1") || !contains(view, "team2") {
+	if !strings.Contains(view, "team1") || !strings.Contains(view, "team2") {
 		t.Fatalf("rendered view missing namespaces:\n%s", view)
 	}
 }
@@ -68,17 +69,6 @@ func TestNamespacesPaneDrillsIntoPods(t *testing.T) {
 	}
 }
 
-// contains is a thin wrapper over strings.Contains used to keep test
-// assertions readable.
-func contains(haystack, needle string) bool {
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return true
-		}
-	}
-	return false
-}
-
 func TestPodsPaneListsPods(t *testing.T) {
 	m := newPickerModel(context.Background(), &fakeLister{namespaces: fixtureNamespaces}, nil)
 	loaded := m.Init()()
@@ -88,10 +78,10 @@ func TestPodsPaneListsPods(t *testing.T) {
 	updated, _ = mm.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	mm = updated.(*model)
 	view := mm.View()
-	if !contains(view, "weather-agent-1") {
+	if !strings.Contains(view, "weather-agent-1") {
 		t.Fatalf("Pods view missing pod name:\n%s", view)
 	}
-	if !contains(view, "Running") {
+	if !strings.Contains(view, "Running") {
 		t.Fatalf("Pods view missing phase column:\n%s", view)
 	}
 }
@@ -179,7 +169,7 @@ func TestPodEnterSurfacesPortForwardError(t *testing.T) {
 	if mm.pane != panePods {
 		t.Fatalf("PF error should keep us on panePods, got %v", mm.pane)
 	}
-	if !contains(mm.pickerErr, "forbidden") {
+	if !strings.Contains(mm.pickerErr, "forbidden") {
 		t.Fatalf("error not surfaced in pickerErr: %q", mm.pickerErr)
 	}
 }

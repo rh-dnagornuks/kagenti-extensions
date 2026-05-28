@@ -55,12 +55,14 @@ func (m *model) currentPodsList() []cluster.Pod {
 }
 
 // startPortForwardCmd produces a Cmd that calls PortForwarder.Start and
-// emits a portForwardReadyMsg. Uses context.Background() because the
-// port-forward subprocess must outlive the per-picker context; it is
-// terminated explicitly via activePF.Close().
-func startPortForwardCmd(pf cluster.PortForwarder, ns, pod string) tea.Cmd {
+// emits a portForwardReadyMsg. ctx bounds the readiness-wait only; the
+// kubectl port-forward subprocess uses exec.Command (not CommandContext)
+// so it survives ctx cancellation and is terminated explicitly via
+// activePF.Close(). Threading the picker ctx in keeps quit responsive
+// during the readiness window.
+func startPortForwardCmd(ctx context.Context, pf cluster.PortForwarder, ns, pod string) tea.Cmd {
 	return func() tea.Msg {
-		conn, err := pf.Start(context.Background(), ns, pod)
+		conn, err := pf.Start(ctx, ns, pod)
 		if err != nil {
 			return portForwardReadyMsg{err: err}
 		}

@@ -112,9 +112,11 @@ func defaultRunner(ctx context.Context, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "kubectl", args...)
 	out, err := cmd.Output()
 	if err != nil {
-		// exec.ExitError carries the stderr we want to surface.
+		// exec.ExitError carries the stderr we want to surface. Drop the
+		// "exit status N" prefix — the stderr already says what failed,
+		// and no caller currently uses errors.As to match the ExitError.
 		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
-			return nil, fmt.Errorf("kubectl: %w: %s", ee, strings.TrimSpace(string(ee.Stderr)))
+			return nil, fmt.Errorf("kubectl: %s", strings.TrimSpace(string(ee.Stderr)))
 		}
 		return nil, fmt.Errorf("kubectl: %w", err)
 	}

@@ -45,7 +45,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 					m.activePF = nil
 				}
 				m.pickerErr = ""
-				return startPortForwardCmd(m.portForwarder, m.selectedNamespace, m.selectedPod)
+				return startPortForwardCmd(m.ctx, m.portForwarder, m.selectedNamespace, m.selectedPod)
 			}
 			return nil
 		case "esc":
@@ -121,7 +121,9 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 
 	case "esc", "left", "h":
 		// Back-out: plugin-detail → pipeline; detail → events; events → sessions.
-		// In picker mode, sessions → pods (tearing down PF + SSE).
+		// In picker mode, the top-level session tabs (paneSessions and
+		// panePipeline are siblings) back out further to the Pods picker,
+		// tearing down PF + SSE.
 		switch m.pane {
 		case panePluginDetail:
 			m.pane = panePipeline
@@ -129,7 +131,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.pane = paneEvents
 		case paneEvents:
 			m.pane = paneSessions
-		case paneSessions:
+		case paneSessions, panePipeline:
 			// Picker mode: back to Pods pane, tearing down the current
 			// port-forward + SSE stream. Bypass mode: no-op (parentCtx
 			// is nil; nowhere to go back to).
@@ -321,6 +323,10 @@ func (m *model) layout() {
 
 	m.sessionsTbl.SetHeight(bodyH)
 	m.bodyHeight = bodyH
+	// Picker tables share the same body area as the session tables so the
+	// terminal real estate stays constant as the user navigates panes.
+	m.namespacesTbl.SetHeight(bodyH)
+	m.podsTbl.SetHeight(bodyH)
 	// The events table's height depends on whether the IDENTITY banner
 	// is rendered for the selected session. rebuildEventsTable() applies
 	// the banner-aware adjustment; call it so the size is correct after
