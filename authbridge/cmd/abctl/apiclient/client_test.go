@@ -146,3 +146,85 @@ func TestPipelinePluginDecodesConfig(t *testing.T) {
 			string(view.Inbound[1].Config))
 	}
 }
+
+func TestGetPluginCatalog(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/plugins" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"plugins": [
+				{"name": "alpha", "description": "A plugin", "writes": ["x"]},
+				{"name": "beta", "requires": ["alpha"]}
+			]
+		}`))
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL)
+	cat, err := c.GetPluginCatalog(context.Background())
+	if err != nil {
+		t.Fatalf("GetPluginCatalog: %v", err)
+	}
+	if len(cat.Plugins) != 2 {
+		t.Fatalf("plugins = %d, want 2", len(cat.Plugins))
+	}
+	if cat.Plugins[0].Description != "A plugin" {
+		t.Errorf("plugins[0].Description = %q", cat.Plugins[0].Description)
+	}
+	if len(cat.Plugins[1].Requires) != 1 || cat.Plugins[1].Requires[0] != "alpha" {
+		t.Errorf("plugins[1].Requires = %v", cat.Plugins[1].Requires)
+	}
+}
+
+// TestPipelinePluginDecodesCapabilityMetadata verifies the new
+// metadata fields decode correctly through the apiclient.
+func TestPipelinePluginDecodesCapabilityMetadata(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/pipeline" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"inbound": [
+				{
+					"name": "rich",
+					"direction": "inbound",
+					"position": 1,
+					"requires": ["a"],
+					"requiresAny": ["b","c"],
+					"after": ["d"],
+					"claims": ["sec"],
+					"description": "Rich plugin"
+				}
+			],
+			"outbound": []
+		}`))
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL)
+	view, err := c.GetPipeline(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := view.Inbound[0]
+	if len(p.Requires) != 1 || p.Requires[0] != "a" {
+		t.Errorf("Requires = %v", p.Requires)
+	}
+	if len(p.RequiresAny) != 2 {
+		t.Errorf("RequiresAny = %v", p.RequiresAny)
+	}
+	if len(p.After) != 1 || p.After[0] != "d" {
+		t.Errorf("After = %v", p.After)
+	}
+	if len(p.Claims) != 1 || p.Claims[0] != "sec" {
+		t.Errorf("Claims = %v", p.Claims)
+	}
+	if p.Description != "Rich plugin" {
+		t.Errorf("Description = %q", p.Description)
+	}
+}
