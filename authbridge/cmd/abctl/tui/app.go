@@ -459,6 +459,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.namespaces = msg.namespaces
 		m.rebuildNamespacesTable()
+		// If the user is on the Pods pane (e.g., reloaded via `r`), refresh
+		// the pods table from the new data so it reflects the cluster state.
+		if m.pane == panePods {
+			m.rebuildPodsTable()
+		}
 		return m, nil
 
 	case portForwardReadyMsg:
@@ -559,7 +564,7 @@ func (m *model) View() string {
 		default:
 			body = m.namespacesTbl.View()
 		}
-		footer := "[↑↓/jk] nav  [↵] open  [q] quit"
+		footer := "[↑↓/jk] nav  [↵] open  [r] reload  [q] quit"
 		if m.pickerErr != "" {
 			footer = "error: " + m.pickerErr + "    " + footer
 		}
@@ -572,7 +577,7 @@ func (m *model) View() string {
 	if m.pane == panePods {
 		title := "abctl · " + m.selectedNamespace + " · pick pod"
 		body := m.podsTbl.View()
-		footer := "[↑↓/jk] nav  [↵] connect  [Esc] back  [q] quit"
+		footer := "[↑↓/jk] nav  [↵] connect  [Esc] back  [r] reload  [q] quit"
 		if m.pickerErr != "" {
 			footer = "error: " + m.pickerErr + "    " + footer
 		}

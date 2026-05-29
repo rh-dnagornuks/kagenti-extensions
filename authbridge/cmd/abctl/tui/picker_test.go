@@ -13,10 +13,14 @@ import (
 	"github.com/kagenti/kagenti-extensions/authbridge/cmd/abctl/cluster"
 )
 
-// fakeLister returns a fixed []AgentNamespace.
-type fakeLister struct{ namespaces []cluster.AgentNamespace }
+// fakeLister returns a fixed []AgentNamespace and counts ListAgents calls.
+type fakeLister struct {
+	namespaces []cluster.AgentNamespace
+	calls      int
+}
 
 func (f *fakeLister) ListAgents(ctx context.Context) ([]cluster.AgentNamespace, error) {
+	f.calls++
 	return f.namespaces, nil
 }
 
@@ -111,6 +115,46 @@ func TestPodsPaneEscBacksOut(t *testing.T) {
 	mm = updated.(*model)
 	if mm.pane != paneNamespaces {
 		t.Fatalf("Esc should back out to Namespaces, got pane %v", mm.pane)
+	}
+}
+
+func TestRefreshKeybindReloadsAgents(t *testing.T) {
+	lister := &fakeLister{namespaces: fixtureNamespaces}
+	m := newPickerModel(context.Background(), lister, nil)
+	// Initial load: 1 call.
+	updated, _ := m.Update(m.Init()())
+	mm := updated.(*model)
+	if lister.calls != 1 {
+		t.Fatalf("after Init: lister.calls = %d, want 1", lister.calls)
+	}
+	mm.pickerErr = "stale error from earlier"
+
+	// `r` from paneNamespaces should re-run loadAgentsCmd and clear the error.
+	_, cmd := mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	if cmd == nil {
+		t.Fatal("`r` on paneNamespaces should produce a Cmd to reload")
+	}
+	_ = cmd() // dispatch the load
+	if lister.calls != 2 {
+		t.Fatalf("after r on paneNamespaces: lister.calls = %d, want 2", lister.calls)
+	}
+	if mm.pickerErr != "" {
+		t.Fatalf("`r` should clear pickerErr, got %q", mm.pickerErr)
+	}
+
+	// Drill into team1, press `r` from panePods. Same effect.
+	updated, _ = mm.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm = updated.(*model)
+	if mm.pane != panePods {
+		t.Fatalf("setup: not on panePods, got %v", mm.pane)
+	}
+	_, cmd = mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	if cmd == nil {
+		t.Fatal("`r` on panePods should produce a Cmd to reload")
+	}
+	_ = cmd()
+	if lister.calls != 3 {
+		t.Fatalf("after r on panePods: lister.calls = %d, want 3", lister.calls)
 	}
 }
 

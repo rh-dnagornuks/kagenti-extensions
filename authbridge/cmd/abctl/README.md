@@ -80,6 +80,7 @@ The UI has three panes. `Enter` drills in; `Esc` backs out.
 | `Enter` | namespaces | open the namespace |
 | `Enter` | pods | port-forward + connect |
 | `Esc` | pods | back to namespaces |
+| `r` | namespaces, pods | reload agent list from cluster |
 | `Enter` / `→` / `l` | sessions, events | drill into selection |
 | `Esc` / `←` / `h` | detail, events | back out |
 | `Esc` | sessions, pipeline | (picker mode) tear down port-forward and back to pods |

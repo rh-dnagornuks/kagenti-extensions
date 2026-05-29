@@ -20,6 +20,9 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 				m.rebuildPodsTable()
 			}
 			return nil
+		case "r":
+			m.pickerErr = ""
+			return loadAgentsCmd(m.ctx, m.lister)
 		case "q", "esc", "ctrl+c":
 			m.cancel()
 			return tea.Quit
@@ -48,6 +51,9 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 				return startPortForwardCmd(m.ctx, m.portForwarder, m.selectedNamespace, m.selectedPod)
 			}
 			return nil
+		case "r":
+			m.pickerErr = ""
+			return loadAgentsCmd(m.ctx, m.lister)
 		case "esc":
 			m.pane = paneNamespaces
 			m.pickerErr = ""
@@ -284,9 +290,9 @@ func (m *model) helpView() string {
 	}
 	switch m.pane {
 	case paneNamespaces:
-		return "[↑↓/jk] nav  [↵] open  [q] quit"
+		return "[↑↓/jk] nav  [↵] open  [r] reload  [q] quit"
 	case panePods:
-		return "[↑↓/jk] nav  [↵] connect  [Esc] back  [q] quit"
+		return "[↑↓/jk] nav  [↵] connect  [Esc] back  [r] reload  [q] quit"
 	case paneSessions:
 		if m.parentCtx != nil {
 			return "[↑↓] nav  [↵] drill  [tab] pipeline  [/] filter  [esc] pods  [p] pause  [q] quit"
