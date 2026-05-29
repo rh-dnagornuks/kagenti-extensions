@@ -663,6 +663,24 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.editState.err = "invalid YAML: " + err.Error()
 			return m, nil
 		}
+		// The user's edited subtree parses standalone, but the framework
+		// loads the WHOLE inner YAML. An indentation mismatch between
+		// the user's edit and the splice site can produce a subtree that
+		// parses on its own yet breaks the combined doc. Splice + reparse
+		// to catch that here, instead of after a 60s kubelet round-trip.
+		previewInner := edit.Splice(
+			m.editState.fetched.InnerYAML,
+			m.editState.fetched.PipelineStart,
+			m.editState.fetched.PipelineEnd,
+			edited,
+		)
+		var combinedVal any
+		if err := yaml.Unmarshal(previewInner, &combinedVal); err != nil {
+			m.editState.phase = editPhaseError
+			m.editState.err = "invalid YAML after splice: " + err.Error() +
+				"\n(probably an indentation mismatch — the pipeline: subtree must start at column 0)"
+			return m, nil
+		}
 		// Pre-apply validation against the catalog. Skipped silently
 		// when the catalog hasn't been fetched yet (operator hasn't
 		// pressed P); the framework's validateRelationships is the
