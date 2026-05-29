@@ -522,6 +522,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.initSessionView()
 
 	case edit.FetchedMsg:
+		if m.editState.phase != editPhaseFetching {
+			return m, nil
+		}
 		if msg.Err != nil {
 			m.editState.phase = editPhaseError
 			m.editState.err = msg.Err.Error()
@@ -533,6 +536,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, openEditorCmd(msg.TempPath)
 
 	case editorExitedMsg:
+		if m.editState.phase != editPhaseEditing || m.editState.fetched == nil {
+			return m, nil
+		}
 		if msg.err != nil {
 			m.editState.phase = editPhaseError
 			m.editState.err = "editor exited: " + msg.err.Error()
@@ -575,6 +581,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case edit.AppliedMsg:
+		// Drop late AppliedMsg deliveries (user aborted before this returned).
+		if m.editState.phase != editPhaseApplying {
+			return m, nil
+		}
 		if msg.Err != nil {
 			m.editState.phase = editPhaseError
 			m.editState.err = "apply failed: " + msg.Err.Error()
@@ -585,6 +595,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, edit.PollCmd(m.ctx, m.statusURL, msg.ApplyTime)
 
 	case edit.PolledMsg:
+		// Drop late PolledMsg deliveries after the user aborted the edit
+		// (phase reset to Done) or the state machine moved on. Without
+		// this guard, m.editState.fetched is nil and we'd panic below.
+		if m.editState.phase != editPhaseWaiting || m.editState.fetched == nil {
+			return m, nil
+		}
 		switch msg.Result.Status {
 		case edit.PollSuccess:
 			m.editState = editState{phase: editPhaseDone}
@@ -612,6 +628,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case edit.RolledBackMsg:
+		if m.editState.phase != editPhaseRollback {
+			return m, nil
+		}
 		m.editState.phase = editPhaseError
 		if msg.Err != nil {
 			m.editState.err = "reload failed: " + msg.ReloadErr +

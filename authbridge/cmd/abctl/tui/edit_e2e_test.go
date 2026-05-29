@@ -305,3 +305,25 @@ func TestEditFlow_RollbackOnReloadFailure(t *testing.T) {
 		t.Fatalf("rollback manifest missing original content:\n%s", runner.applyManifest)
 	}
 }
+
+// TestEditFlow_LatePolledMsgAfterAbort verifies that a PolledMsg
+// arriving after the user has aborted the edit (editState reset to
+// Done, fetched = nil) is dropped rather than panicking on a nil
+// dereference of editState.fetched.
+func TestEditFlow_LatePolledMsgAfterAbort(t *testing.T) {
+	m := newPickerModel(context.Background(), nil, nil)
+	m.pane = panePipeline
+	// editState.phase is editPhaseDone (zero value), fetched is nil.
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("late PolledMsg should be dropped, but panicked: %v", r)
+		}
+	}()
+	late := edit.PolledMsg{Result: edit.PollResult{Status: edit.PollFailure, LastError: "anything"}}
+	updated, _ := m.Update(late)
+	mm := updated.(*model)
+	if mm.editState.phase != editPhaseDone {
+		t.Fatalf("phase changed on late PolledMsg: %v", mm.editState.phase)
+	}
+}
