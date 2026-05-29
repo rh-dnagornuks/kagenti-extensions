@@ -253,6 +253,7 @@ func main() {
 			cfg.Listener.SessionAPIAddr,
 			sessions,
 			sessionapi.WithPipelines(inboundH, outboundH),
+			sessionapi.WithCatalog(sessionapi.PluginsCatalog),
 		)
 		go func() {
 			slog.Warn("session API listening — UNAUTHENTICATED; contains raw user content; never expose via ingress",

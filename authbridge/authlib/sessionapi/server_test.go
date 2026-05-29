@@ -611,3 +611,126 @@ func TestHandleGet_SerializesPluginsMap(t *testing.T) {
 		t.Errorf("payload drift: %+v", payload)
 	}
 }
+
+// TestHandlePipelineSurfacesCapabilityMetadata verifies the new
+// metadata fields (Requires/RequiresAny/After/Claims/Description)
+// flow through to /v1/pipeline and are omitted when empty.
+func TestHandlePipelineSurfacesCapabilityMetadata(t *testing.T) {
+	rich := pipeline.PluginCapabilities{
+		Writes:      []string{"mcp"},
+		Requires:    []string{"a2a-parser"},
+		RequiresAny: []string{"jwt-validation", "token-broker"},
+		After:       []string{"mcp-parser"},
+		Claims:      []string{"authorization-header"},
+		Description: "Test plugin description",
+	}
+	inbound, err := pipeline.New([]pipeline.Plugin{
+		&fakePlugin{name: "rich-plugin", caps: rich},
+		&fakePlugin{name: "bare-plugin"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	srv := New(":0", store, WithPipelines(pipeline.NewHolder(inbound), nil))
+	ts := httptest.NewServer(srv.server.Handler)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/v1/pipeline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// Decode into raw JSON to verify omitempty for the bare plugin.
+	var raw struct {
+		Inbound []map[string]any `json:"inbound"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.Inbound) != 2 {
+		t.Fatalf("inbound = %d, want 2", len(raw.Inbound))
+	}
+
+	got := raw.Inbound[0]
+	if got["description"] != "Test plugin description" {
+		t.Errorf("description = %v", got["description"])
+	}
+	if reqs, _ := got["requires"].([]any); len(reqs) != 1 || reqs[0] != "a2a-parser" {
+		t.Errorf("requires = %v", got["requires"])
+	}
+	if reqA, _ := got["requiresAny"].([]any); len(reqA) != 2 {
+		t.Errorf("requiresAny = %v", got["requiresAny"])
+	}
+	if a, _ := got["after"].([]any); len(a) != 1 || a[0] != "mcp-parser" {
+		t.Errorf("after = %v", got["after"])
+	}
+	if c, _ := got["claims"].([]any); len(c) != 1 || c[0] != "authorization-header" {
+		t.Errorf("claims = %v", got["claims"])
+	}
+
+	bare := raw.Inbound[1]
+	for _, k := range []string{"requires", "requiresAny", "after", "claims", "description"} {
+		if _, present := bare[k]; present {
+			t.Errorf("bare plugin should omit %q, got %v", k, bare[k])
+		}
+	}
+}
+
+func TestHandlePluginCatalog_ListsRegisteredPlugins(t *testing.T) {
+	stub := func() []CatalogEntry {
+		return []CatalogEntry{
+			{Name: "alpha", Description: "First plugin", Writes: []string{"x"}},
+			{Name: "beta", Requires: []string{"alpha"}},
+		}
+	}
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	srv := New(":0", store, WithCatalog(stub))
+	ts := httptest.NewServer(srv.server.Handler)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/v1/plugins")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var body struct {
+		Plugins []CatalogEntry `json:"plugins"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Plugins) != 2 {
+		t.Fatalf("plugins = %d, want 2", len(body.Plugins))
+	}
+	if body.Plugins[0].Name != "alpha" || body.Plugins[0].Description != "First plugin" {
+		t.Errorf("plugins[0] = %+v", body.Plugins[0])
+	}
+	if len(body.Plugins[1].Requires) != 1 || body.Plugins[1].Requires[0] != "alpha" {
+		t.Errorf("plugins[1].Requires = %v", body.Plugins[1].Requires)
+	}
+}
+
+func TestHandlePluginCatalog_NoProvider404(t *testing.T) {
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+	srv := New(":0", store) // no WithCatalog
+	ts := httptest.NewServer(srv.server.Handler)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/v1/plugins")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 404 {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
