@@ -429,9 +429,13 @@ func TestA2AParser_OnResponse_NoRequestContext(t *testing.T) {
 	}
 }
 
+// TestA2AParser_OnResponse_EmptyBody locks the regression: when the
+// request side parsed (Extensions.A2A populated) but response body is
+// empty, the parser MUST record a Skip so abctl pairs the timeline rows.
 func TestA2AParser_OnResponse_EmptyBody(t *testing.T) {
 	p := NewA2AParser()
 	pctx := &pipeline.Context{
+		Direction:  pipeline.Inbound,
 		Extensions: pipeline.Extensions{A2A: &pipeline.A2AExtension{Method: "message/send"}},
 	}
 	action := p.OnResponse(context.Background(), pctx)
@@ -440,6 +444,13 @@ func TestA2AParser_OnResponse_EmptyBody(t *testing.T) {
 	}
 	if pctx.Extensions.A2A.SessionID != "" {
 		t.Errorf("SessionID should remain empty, got %q", pctx.Extensions.A2A.SessionID)
+	}
+	if pctx.Extensions.Invocations == nil {
+		t.Fatal("expected a Skip Invocation, got none")
+	}
+	invs := pctx.Extensions.Invocations.Inbound
+	if len(invs) != 1 || invs[0].Action != pipeline.ActionSkip || invs[0].Reason != "no_response_body" {
+		t.Fatalf("expected single Skip/no_response_body, got %+v", invs)
 	}
 }
 

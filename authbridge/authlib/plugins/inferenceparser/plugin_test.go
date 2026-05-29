@@ -395,9 +395,14 @@ func TestInferenceParser_OnResponse_NoRequestContext(t *testing.T) {
 	}
 }
 
+// TestInferenceParser_OnResponse_EmptyBody locks the regression: when
+// the request side parsed (Extensions.Inference populated) but the
+// response body is empty, the parser MUST record a Skip so abctl pairs
+// the timeline rows.
 func TestInferenceParser_OnResponse_EmptyBody(t *testing.T) {
 	p := NewInferenceParser()
 	pctx := &pipeline.Context{
+		Direction:  pipeline.Outbound,
 		Extensions: pipeline.Extensions{Inference: &pipeline.InferenceExtension{Model: "gpt-4"}},
 	}
 	action := p.OnResponse(context.Background(), pctx)
@@ -406,6 +411,13 @@ func TestInferenceParser_OnResponse_EmptyBody(t *testing.T) {
 	}
 	if pctx.Extensions.Inference.Completion != "" {
 		t.Errorf("Completion = %q, want empty", pctx.Extensions.Inference.Completion)
+	}
+	if pctx.Extensions.Invocations == nil {
+		t.Fatal("expected a Skip Invocation, got none")
+	}
+	invs := pctx.Extensions.Invocations.Outbound
+	if len(invs) != 1 || invs[0].Action != pipeline.ActionSkip || invs[0].Reason != "no_response_body" {
+		t.Fatalf("expected single Skip/no_response_body, got %+v", invs)
 	}
 }
 
