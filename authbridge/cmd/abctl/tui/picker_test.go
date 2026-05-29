@@ -134,17 +134,19 @@ func TestRefreshKeybindReloadsAgents(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("`r` on paneNamespaces should produce a Cmd to reload")
 	}
-	loaded := cmd() // dispatch the load
-	if lister.calls != 2 {
-		t.Fatalf("after r on paneNamespaces: lister.calls = %d, want 2", lister.calls)
-	}
 	if mm.pickerErr != "" {
 		t.Fatalf("`r` should clear pickerErr, got %q", mm.pickerErr)
 	}
-	// Deliver the agentsLoadedMsg so m.loading flips back to false; otherwise
-	// the next `r` would be gated.
-	updated, _ = mm.Update(loaded)
+	// Run the Cmd and feed its message through Update so the post-reload
+	// transition (clear m.loading, rebuild table) actually runs.
+	updated, _ = mm.Update(cmd())
 	mm = updated.(*model)
+	if lister.calls != 2 {
+		t.Fatalf("after r on paneNamespaces: lister.calls = %d, want 2", lister.calls)
+	}
+	if mm.loading {
+		t.Fatal("agentsLoadedMsg should clear m.loading")
+	}
 
 	// Drill into team1, press `r` from panePods. Same effect.
 	updated, _ = mm.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -156,9 +158,14 @@ func TestRefreshKeybindReloadsAgents(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("`r` on panePods should produce a Cmd to reload")
 	}
-	_ = cmd()
+	updated, _ = mm.Update(cmd())
+	mm = updated.(*model)
 	if lister.calls != 3 {
 		t.Fatalf("after r on panePods: lister.calls = %d, want 3", lister.calls)
+	}
+	// Pane stays on panePods (selectedNamespace still exists in the new data).
+	if mm.pane != panePods {
+		t.Fatalf("after r on panePods with stable data: pane = %v, want panePods", mm.pane)
 	}
 }
 

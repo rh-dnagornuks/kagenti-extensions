@@ -6,7 +6,7 @@
 # that just verifies prerequisites and runs the binary. The picker
 # discovers the agent automatically; the user picks team1/email-agent.
 
-set -uo pipefail
+set -euo pipefail
 
 NAMESPACE=${1:-team1}
 AGENT_NAME=${2:-email-agent}
