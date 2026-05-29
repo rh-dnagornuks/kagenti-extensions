@@ -89,8 +89,54 @@ The UI has three panes. `Enter` drills in; `Esc` backs out.
 | `p` | any | pause/resume stream |
 | `y` | detail | yank event JSON to `/tmp` |
 | `g` / `G` | lists | jump to top / bottom |
+| `e` | pipeline | edit pipeline subtree in `$EDITOR` |
+| `y` | edit/diff | apply the edit |
+| `N` | edit/diff | abort the edit |
+| `r` | edit/error | re-open the editor with the same tempfile |
+| `Esc` | edit/* | abort the edit, return to Pipeline pane |
 | `?` | any | (reserved for future help overlay) |
 | `q` / `Ctrl+C` | any | quit |
+
+## Editing the pipeline
+
+Press `e` on the Pipeline pane to edit the agent's runtime `pipeline:`
+subtree in `$EDITOR` (or `vi` if unset). On save, abctl shows a diff
+and asks `apply this change? (y/N)`. Confirming runs
+`kubectl apply --server-side` against the per-agent ConfigMap, then
+polls the framework's `/reload/status` until the reload completes
+(success or failure).
+
+The single edit flow covers four operations:
+- **Edit a value** — change a config field of an existing plugin
+- **Reorder** — move a plugin's lines up or down
+- **Remove** — delete a plugin's entry from `inbound:` or `outbound:`
+- **Add** — append a new plugin entry
+
+All four work because they're all just lines you change inside the
+pipeline subtree.
+
+### Permissions
+
+abctl shells out to `kubectl`; kubectl uses your kubeconfig. Editing
+requires `update` on `configmaps` in the agent's namespace (in
+addition to `get pods` which the picker already needs). RBAC denial
+surfaces verbatim in the overlay.
+
+### Tempfile lifecycle
+
+abctl writes the editable pipeline subtree to `$TMPDIR/abctl-pipeline-*.yaml`
+on every edit. The tempfile is **left in place on every exit path**
+(success, error, abort) so an interrupted edit is recoverable. Clean
+up `/tmp/abctl-pipeline-*` periodically.
+
+### Hot-reload window
+
+The framework reloads via a config-file watcher; kubelet syncs
+ConfigMap edits into the pod's mount within ~60s, then the framework
+debounces and reloads. Total wall-clock from `apply` to reload is
+typically under 90s. abctl shows a spinner during the wait. If
+`/reload/status` doesn't observe a successful reload within 120s,
+abctl gives up watching and tells you to check `kubectl logs deploy/<agent>`.
 
 ## Trust model
 
