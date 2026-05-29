@@ -39,6 +39,10 @@ type editFakeRunner struct {
 func (f *editFakeRunner) run(ctx context.Context, args ...string) ([]byte, error) {
 	f.captured = append(f.captured, strings.Join(args, " "))
 	if len(args) > 0 && args[0] == "get" {
+		// Pod-label lookup for ResolveAgentName: kubectl get pod ... -o jsonpath=...
+		if len(args) >= 2 && args[1] == "pod" {
+			return []byte("email-agent"), nil
+		}
 		return f.getResponse, nil
 	}
 	if len(args) > 0 && args[0] == "apply" {

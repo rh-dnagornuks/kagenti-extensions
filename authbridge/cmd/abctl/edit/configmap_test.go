@@ -305,6 +305,35 @@ session:
 	}
 }
 
+func TestResolveAgentName_FromLabel(t *testing.T) {
+	stub := func(ctx context.Context, args ...string) ([]byte, error) {
+		if len(args) < 2 || args[0] != "get" || args[1] != "pod" {
+			t.Fatalf("unexpected args: %v", args)
+		}
+		return []byte("email-agent\n"), nil
+	}
+	got, err := ResolveAgentName(context.Background(), stub, "team1", "email-agent-779bb85688-4x8zg")
+	if err != nil {
+		t.Fatalf("ResolveAgentName: %v", err)
+	}
+	if got != "email-agent" {
+		t.Fatalf("got %q want %q", got, "email-agent")
+	}
+}
+
+func TestResolveAgentName_FallbackToPodSuffixStrip(t *testing.T) {
+	stub := func(ctx context.Context, args ...string) ([]byte, error) {
+		return []byte(""), nil // label absent
+	}
+	got, err := ResolveAgentName(context.Background(), stub, "team1", "email-agent-779bb85688-4x8zg")
+	if err != nil {
+		t.Fatalf("ResolveAgentName: %v", err)
+	}
+	if got != "email-agent" {
+		t.Fatalf("got %q want %q (RS-hash + pod-suffix should be stripped)", got, "email-agent")
+	}
+}
+
 // equalArgs checks two []string for equality.
 func equalArgs(a, b []string) bool {
 	if len(a) != len(b) {

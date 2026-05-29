@@ -16,13 +16,18 @@ type FetchedMsg struct {
 	Err      error
 }
 
-// FetchCmd returns a tea.Cmd that fetches the agent's ConfigMap, locates
+// FetchCmd returns a tea.Cmd that resolves the pod's agent name (via the
+// app.kubernetes.io/name label), fetches the agent's ConfigMap, locates
 // the pipeline subtree, writes the subtree to a tempfile (ready for
 // $EDITOR), and emits FetchedMsg. The tempfile lives in $TMPDIR; abctl
 // leaves it in place on every exit path (success, error, abort) so users
 // can recover an in-progress edit.
-func FetchCmd(ctx context.Context, run Runner, namespace, agent string) tea.Cmd {
+func FetchCmd(ctx context.Context, run Runner, namespace, pod string) tea.Cmd {
 	return func() tea.Msg {
+		agent, err := ResolveAgentName(ctx, run, namespace, pod)
+		if err != nil {
+			return FetchedMsg{Err: err}
+		}
 		fp, err := Fetch(ctx, run, namespace, agent)
 		if err != nil {
 			return FetchedMsg{Err: err}

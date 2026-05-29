@@ -183,6 +183,28 @@ type FetchedPipeline struct {
 	PipelineEnd   int    // byte offset where the subtree ends
 }
 
+// ResolveAgentName looks up the agent name for a pod via its
+// app.kubernetes.io/name label, which matches the per-agent ConfigMap
+// suffix (authbridge-config-<agent>). Falls back to stripping the last
+// two dash-separated segments (the ReplicaSet hash + pod suffix) when
+// the label is absent.
+func ResolveAgentName(ctx context.Context, run Runner, namespace, pod string) (string, error) {
+	out, err := run(ctx, "get", "pod", pod, "-n", namespace,
+		"-o", "jsonpath={.metadata.labels.app\\.kubernetes\\.io/name}")
+	if err != nil {
+		return "", err
+	}
+	name := strings.TrimSpace(string(out))
+	if name != "" {
+		return name, nil
+	}
+	parts := strings.Split(pod, "-")
+	if len(parts) >= 3 {
+		return strings.Join(parts[:len(parts)-2], "-"), nil
+	}
+	return pod, nil
+}
+
 // Fetch reads the per-agent ConfigMap (authbridge-config-<agent>), extracts
 // the inner runtime YAML from data.config.yaml, and locates the pipeline
 // subtree's byte range. Returns an error if the ConfigMap doesn't exist,
