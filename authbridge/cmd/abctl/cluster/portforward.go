@@ -59,8 +59,10 @@ type PortForwarder interface {
 // PortForward is a live tunnel to a pod. The caller MUST Close it
 // exactly once.
 type PortForward interface {
-	// Endpoint is the URL abctl points its apiclient at.
+	// Endpoint is the URL abctl points its apiclient at (:9094 session API).
 	Endpoint() string
+	// StatusEndpoint is the URL of the agent's stat server (:9093 /reload/status).
+	StatusEndpoint() string
 	// Close terminates the tunnel and waits for it to exit.
 	Close() error
 }
@@ -81,6 +83,10 @@ func (k *kubectlPortForwarder) Start(ctx context.Context, namespace, pod string)
 	if err != nil {
 		return nil, err
 	}
+	statusPort, err := freeLocalPort()
+	if err != nil {
+		return nil, err
+	}
 	// We do NOT bind ctx to the subprocess — kubectl port-forward should
 	// outlive the per-call context (which is just for the readiness
 	// check). The subprocess is terminated explicitly via Close.
@@ -88,6 +94,7 @@ func (k *kubectlPortForwarder) Start(ctx context.Context, namespace, pod string)
 		"-n", namespace,
 		"pod/"+pod,
 		strconv.Itoa(port)+":9094",
+		strconv.Itoa(statusPort)+":9093",
 	)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -96,7 +103,7 @@ func (k *kubectlPortForwarder) Start(ctx context.Context, namespace, pod string)
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start kubectl port-forward: %w", err)
 	}
-	pf := &kubectlPortForward{cmd: cmd, port: port, stderr: stderr}
+	pf := &kubectlPortForward{cmd: cmd, port: port, statusPort: statusPort, stderr: stderr}
 	pf.startStderrDrain()
 
 	readyCtx, cancel := context.WithTimeout(ctx, pfReadyTimeout)
@@ -110,13 +117,22 @@ func (k *kubectlPortForwarder) Start(ctx context.Context, namespace, pod string)
 		}
 		return nil, fmt.Errorf("port-forward not ready: %w", err)
 	}
+	if err := waitForAccept(readyCtx, statusPort); err != nil {
+		_ = pf.Close()
+		stderrTail := pf.stderrTail()
+		if stderrTail != "" {
+			return nil, fmt.Errorf("port-forward (:9093) not ready: %w (stderr: %s)", err, stderrTail)
+		}
+		return nil, fmt.Errorf("port-forward (:9093) not ready: %w", err)
+	}
 	return pf, nil
 }
 
 type kubectlPortForward struct {
-	cmd    *exec.Cmd
-	port   int
-	stderr io.ReadCloser
+	cmd        *exec.Cmd
+	port       int // local 127.0.0.1 port forwarding to pod :9094
+	statusPort int // local 127.0.0.1 port forwarding to pod :9093
+	stderr     io.ReadCloser
 
 	mu          sync.Mutex
 	stderrLines []string
@@ -125,6 +141,13 @@ type kubectlPortForward struct {
 
 func (p *kubectlPortForward) Endpoint() string {
 	return "http://127.0.0.1:" + strconv.Itoa(p.port)
+}
+
+// StatusEndpoint is the URL of the agent's stat server (:9093) reached
+// via the picker's port-forward. abctl's edit flow polls /reload/status
+// here.
+func (p *kubectlPortForward) StatusEndpoint() string {
+	return "http://127.0.0.1:" + strconv.Itoa(p.statusPort)
 }
 
 func (p *kubectlPortForward) Close() error {
