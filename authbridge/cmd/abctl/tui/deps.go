@@ -1,0 +1,161 @@
+package tui
+
+import (
+	"fmt"
+
+	"github.com/kagenti/kagenti-extensions/authbridge/cmd/abctl/apiclient"
+)
+
+// depCheck describes whether one declared dependency is satisfied by
+// the rest of a same-direction chain. Used by both the Pipeline pane's
+// per-row indicator and the Plugin-detail pane's per-Requires section.
+type depCheck struct {
+	Name      string // the dependency-target plugin name
+	Satisfied bool
+	// UpstreamPosition is the 1-based position of the satisfying
+	// upstream plugin when Satisfied is true, otherwise 0.
+	UpstreamPosition int
+}
+
+// sameDirectionChain returns the slice of plugins in p's chain. Caller
+// supplies the full PipelineView so we can look up the right side
+// without re-fetching.
+func sameDirectionChain(p *apiclient.PipelinePlugin, view *apiclient.PipelineView) []apiclient.PipelinePlugin {
+	if view == nil {
+		return nil
+	}
+	if p.Direction == "inbound" {
+		return view.Inbound
+	}
+	if p.Direction == "outbound" {
+		return view.Outbound
+	}
+	return nil
+}
+
+// requiresStatus returns one depCheck per entry in p.Requires.
+// Satisfied iff the named plugin is present at a strictly-lower
+// position. (RequiresAny semantics differ; see requiresAnyStatus.)
+func requiresStatus(p *apiclient.PipelinePlugin, chain []apiclient.PipelinePlugin) []depCheck {
+	out := make([]depCheck, 0, len(p.Requires))
+	for _, name := range p.Requires {
+		c := depCheck{Name: name}
+		for _, q := range chain {
+			if q.Name == name && q.Position < p.Position {
+				c.Satisfied = true
+				c.UpstreamPosition = q.Position
+				break
+			}
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// requiresAnyOK returns true iff at least one of p.RequiresAny appears
+// at a lower position. The framework's validateRelationships also
+// requires that EVERY listed name that IS present must be earlier;
+// this convenience returns just the at-least-one bit. The detail pane
+// renders the per-name breakdown alongside.
+func requiresAnyOK(p *apiclient.PipelinePlugin, chain []apiclient.PipelinePlugin) bool {
+	if len(p.RequiresAny) == 0 {
+		return true
+	}
+	for _, name := range p.RequiresAny {
+		for _, q := range chain {
+			if q.Name == name && q.Position < p.Position {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// requiresAnyStatus returns one depCheck per entry in p.RequiresAny.
+// Satisfied means "present at lower position." Used by the detail
+// pane to show which alternatives currently satisfy the OR-group.
+func requiresAnyStatus(p *apiclient.PipelinePlugin, chain []apiclient.PipelinePlugin) []depCheck {
+	out := make([]depCheck, 0, len(p.RequiresAny))
+	for _, name := range p.RequiresAny {
+		c := depCheck{Name: name}
+		for _, q := range chain {
+			if q.Name == name && q.Position < p.Position {
+				c.Satisfied = true
+				c.UpstreamPosition = q.Position
+				break
+			}
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// afterStatus returns one depCheck per entry in p.After. Satisfied
+// when the named plugin is absent (After is a soft hint) or present
+// at a lower position. Misorder (present at higher position) is the
+// only failure case.
+func afterStatus(p *apiclient.PipelinePlugin, chain []apiclient.PipelinePlugin) []depCheck {
+	out := make([]depCheck, 0, len(p.After))
+	for _, name := range p.After {
+		c := depCheck{Name: name, Satisfied: true}
+		for _, q := range chain {
+			if q.Name == name {
+				if q.Position < p.Position {
+					c.UpstreamPosition = q.Position
+				} else if q.Position > p.Position {
+					c.Satisfied = false
+				}
+				break
+			}
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// pluginDepsAllSatisfied returns true iff Requires, RequiresAny, and
+// After are all OK for p in chain. Drives the Pipeline pane's per-row
+// ✓/✗ indicator. Plugins with no declared deps are always ✓.
+func pluginDepsAllSatisfied(p *apiclient.PipelinePlugin, chain []apiclient.PipelinePlugin) bool {
+	for _, c := range requiresStatus(p, chain) {
+		if !c.Satisfied {
+			return false
+		}
+	}
+	if !requiresAnyOK(p, chain) {
+		return false
+	}
+	for _, c := range afterStatus(p, chain) {
+		if !c.Satisfied {
+			return false
+		}
+	}
+	return true
+}
+
+// pluginHasAnyDeps reports whether p declares any dependency that the
+// indicator can render. Plugins without any declarations get a blank
+// indicator (no false-positive ✓).
+func pluginHasAnyDeps(p *apiclient.PipelinePlugin) bool {
+	return len(p.Requires) > 0 || len(p.RequiresAny) > 0 || len(p.After) > 0
+}
+
+// formatDepCheck returns a one-line description of a dependency check.
+// Catalog-mode (no chain to check against) skips the ✓/✗ prefix and
+// just shows the name — operators see the declared dependency without
+// a misleading "satisfied" claim.
+func formatDepCheck(c depCheck, withStatus bool) string {
+	if !withStatus {
+		return c.Name
+	}
+	if c.Satisfied {
+		if c.UpstreamPosition > 0 {
+			return styleOK.Render("✓ ") + c.Name +
+				styleHint.Render(fmt.Sprintf("  — at position %d", c.UpstreamPosition))
+		}
+		return styleOK.Render("✓ ") + c.Name +
+			styleHint.Render("  — absent (soft)")
+	}
+	return styleError.Render("✗ ") + c.Name +
+		styleHint.Render("  — NOT in this chain")
+}

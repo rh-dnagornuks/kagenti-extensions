@@ -18,6 +18,7 @@ func newPipelineTable() table.Model {
 			{Title: "#", Width: 3},
 			{Title: "DIRECTION", Width: 10},
 			{Title: "PLUGIN", Width: 22},
+			{Title: "DEPS", Width: 5},
 			{Title: "WRITES", Width: 18},
 			{Title: "BODY", Width: 6},
 			{Title: "EVENTS", Width: 8},
@@ -41,12 +42,12 @@ func (m *model) rebuildPipelineTable() {
 
 	rows := make([]table.Row, 0, len(m.pipeline.Inbound)+len(m.pipeline.Outbound)+1)
 	for _, p := range m.pipeline.Inbound {
-		rows = append(rows, pipelineRow(p, counts[p.Name]))
+		rows = append(rows, pipelineRow(p, counts[p.Name], m.pipeline.Inbound))
 	}
 	// Divider between inbound and outbound.
-	rows = append(rows, table.Row{"", "", "── (app) ──", "", "", ""})
+	rows = append(rows, table.Row{"", "", "── (app) ──", "", "", "", ""})
 	for _, p := range m.pipeline.Outbound {
-		rows = append(rows, pipelineRow(p, counts[p.Name]))
+		rows = append(rows, pipelineRow(p, counts[p.Name], m.pipeline.Outbound))
 	}
 	m.pipelineTbl.SetRows(rows)
 	// If cursor is on the divider row, nudge to the next plugin.
@@ -55,7 +56,7 @@ func (m *model) rebuildPipelineTable() {
 	}
 }
 
-func pipelineRow(p apiclient.PipelinePlugin, events int) table.Row {
+func pipelineRow(p apiclient.PipelinePlugin, events int, chain []apiclient.PipelinePlugin) table.Row {
 	body := "no"
 	if p.BodyAccess {
 		body = "yes"
@@ -63,6 +64,18 @@ func pipelineRow(p apiclient.PipelinePlugin, events int) table.Row {
 	eventsStr := ""
 	if events > 0 {
 		eventsStr = fmt.Sprintf("%d", events)
+	}
+	// DEPS column: ✓ when all declared dependencies are met, ✗ when any
+	// fail, blank when the plugin declares no Requires/RequiresAny/After.
+	// Blank vs ✓ avoids a misleading "looks fine" mark on plugins that
+	// have nothing to verify in the first place.
+	deps := ""
+	if pluginHasAnyDeps(&p) {
+		if pluginDepsAllSatisfied(&p, chain) {
+			deps = "✓"
+		} else {
+			deps = "✗"
+		}
 	}
 	// Plugin names used to be colored by protocol but bubbles v1's
 	// runewidth.Truncate miscounts ANSI escape bytes as visible width,
@@ -72,6 +85,7 @@ func pipelineRow(p apiclient.PipelinePlugin, events int) table.Row {
 		fmt.Sprintf("%d", p.Position),
 		p.Direction,
 		p.Name,
+		deps,
 		strings.Join(p.Writes, ","),
 		body,
 		eventsStr,
@@ -116,6 +130,30 @@ func (m *model) selectedPlugin() *apiclient.PipelinePlugin {
 	return nil
 }
 
+// unmetDepsCount returns how many active plugins have at least one
+// unsatisfied Requires/RequiresAny/After dependency. Pulls from the
+// active pipeline view so a hot-reload that lands a new chain
+// immediately reflects in the count.
+func (m *model) unmetDepsCount() int {
+	if m.pipeline == nil {
+		return 0
+	}
+	n := 0
+	for i := range m.pipeline.Inbound {
+		p := &m.pipeline.Inbound[i]
+		if pluginHasAnyDeps(p) && !pluginDepsAllSatisfied(p, m.pipeline.Inbound) {
+			n++
+		}
+	}
+	for i := range m.pipeline.Outbound {
+		p := &m.pipeline.Outbound[i]
+		if pluginHasAnyDeps(p) && !pluginDepsAllSatisfied(p, m.pipeline.Outbound) {
+			n++
+		}
+	}
+	return n
+}
+
 // countEventsPerPlugin counts how many times each plugin actually ran
 // across all cached events, by walking every event's Invocations list.
 // This includes auth-gate plugins (jwt-validation, token-exchange, ibac)
@@ -139,4 +177,3 @@ func (m *model) countEventsPerPlugin() map[string]int {
 	}
 	return counts
 }
-

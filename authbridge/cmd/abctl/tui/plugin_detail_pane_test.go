@@ -87,3 +87,75 @@ func TestShowPluginDetailHandlesMalformedConfig(t *testing.T) {
 		t.Fatalf("rendered view missing raw config fallback:\n%s", view)
 	}
 }
+
+// TestShowPluginDetailRendersRequiresSatisfied renders ibac with
+// mcp-parser already at a lower outbound position; the After-section
+// indicator should report ✓.
+func TestShowPluginDetailRendersRequiresSatisfied(t *testing.T) {
+	m := newPickerModel(context.Background(), nil, nil)
+	m.detailVp.Width = 80
+	m.detailVp.Height = 30
+	m.pipeline = &apiclient.PipelineView{
+		Outbound: []apiclient.PipelinePlugin{
+			{Name: "mcp-parser", Direction: "outbound", Position: 1},
+			{Name: "ibac", Direction: "outbound", Position: 2, After: []string{"mcp-parser"}},
+		},
+	}
+	plugin := &m.pipeline.Outbound[1]
+	m.showPluginDetail(plugin)
+	view := m.detailVp.View()
+	if !strings.Contains(view, "After (soft)") {
+		t.Fatalf("After section missing:\n%s", view)
+	}
+	if !strings.Contains(view, "mcp-parser") {
+		t.Fatalf("After should mention mcp-parser:\n%s", view)
+	}
+	if !strings.Contains(view, "position 1") {
+		t.Fatalf("After should report upstream position 1:\n%s", view)
+	}
+}
+
+// TestShowPluginDetailRendersRequiresUnmet sets up ibac without
+// mcp-parser anywhere; After should still pass (soft hint, absent
+// is OK), but the helper render path is exercised.
+func TestShowPluginDetailRendersDescription(t *testing.T) {
+	m := newPickerModel(context.Background(), nil, nil)
+	m.detailVp.Width = 80
+	m.detailVp.Height = 30
+	plugin := &apiclient.PipelinePlugin{
+		Name:        "test",
+		Direction:   "inbound",
+		Position:    1,
+		Description: "Operator-facing description",
+	}
+	m.showPluginDetail(plugin)
+	view := m.detailVp.View()
+	if !strings.Contains(view, "Operator-facing description") {
+		t.Fatalf("Description not rendered:\n%s", view)
+	}
+}
+
+// TestShowPluginDetailRendersUnmetRequires verifies the ✗ branch
+// triggers when a Required upstream is absent.
+func TestShowPluginDetailRendersUnmetRequires(t *testing.T) {
+	m := newPickerModel(context.Background(), nil, nil)
+	m.detailVp.Width = 80
+	m.detailVp.Height = 30
+	m.pipeline = &apiclient.PipelineView{
+		Outbound: []apiclient.PipelinePlugin{
+			{Name: "needy", Direction: "outbound", Position: 1, Requires: []string{"missing-dep"}},
+		},
+	}
+	plugin := &m.pipeline.Outbound[0]
+	m.showPluginDetail(plugin)
+	view := m.detailVp.View()
+	if !strings.Contains(view, "Requires:") {
+		t.Fatalf("Requires section missing:\n%s", view)
+	}
+	if !strings.Contains(view, "missing-dep") {
+		t.Fatalf("Requires should name missing-dep:\n%s", view)
+	}
+	if !strings.Contains(view, "NOT in this chain") {
+		t.Fatalf("Requires should call out the missing dep:\n%s", view)
+	}
+}

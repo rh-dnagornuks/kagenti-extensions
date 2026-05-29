@@ -345,10 +345,19 @@ func (m *model) helpView() string {
 	case paneDetail:
 		return "[↑↓] scroll  [y] yank  [esc] back  [q] quit"
 	case panePipeline:
+		var base string
 		if m.parentCtx != nil {
-			return "[↑↓] nav  [↵] plugin detail  [e] edit  [tab] sessions  [esc] pods  [q] quit"
+			base = "[↑↓] nav  [↵] plugin detail  [e] edit  [tab] sessions  [esc] pods  [q] quit"
+		} else {
+			base = "[↑↓] nav  [↵] plugin detail  [e] edit  [tab] sessions  [q] quit"
 		}
-		return "[↑↓] nav  [↵] plugin detail  [e] edit  [tab] sessions  [q] quit"
+		// Surface a count of plugins with unmet dependencies so a single
+		// "✗" in the DEPS column doesn't get lost in a long list.
+		if n := m.unmetDepsCount(); n > 0 {
+			base = fmt.Sprintf("%s  ·  %d plugin%s with unmet deps",
+				base, n, plural(n))
+		}
+		return base
 	case panePluginDetail:
 		return "[↑↓] scroll  [esc] back  [q] quit"
 	}
