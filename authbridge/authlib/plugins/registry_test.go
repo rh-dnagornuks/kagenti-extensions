@@ -3,6 +3,7 @@ package plugins
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/config"
@@ -432,8 +433,10 @@ type consumerPlugin struct {
 	setProvider *spiffe.Provider
 }
 
-func (p *consumerPlugin) Name() string                              { return p.name }
-func (p *consumerPlugin) Capabilities() pipeline.PluginCapabilities { return pipeline.PluginCapabilities{} }
+func (p *consumerPlugin) Name() string { return p.name }
+func (p *consumerPlugin) Capabilities() pipeline.PluginCapabilities {
+	return pipeline.PluginCapabilities{}
+}
 func (p *consumerPlugin) OnRequest(context.Context, *pipeline.Context) pipeline.Action {
 	return pipeline.Action{Type: pipeline.Continue}
 }
@@ -611,5 +614,152 @@ func TestBuildWithSPIFFEWrapsConfigurablePluginsForRawConfig(t *testing.T) {
 	_, ok = plugins[1].(pipeline.RawConfigProvider)
 	if ok {
 		t.Fatal("non-Configurable plugin should NOT be wrapped")
+	}
+}
+
+// TestCatalog_IncludesRegisteredPlugins verifies Catalog() walks the
+// registry, calls each factory once, and returns sorted CatalogEntries
+// carrying the static capabilities each plugin advertises.
+func TestCatalog_IncludesRegisteredPlugins(t *testing.T) {
+	resetCatalogCache()
+	t.Cleanup(resetCatalogCache)
+	const a, b = "test-catalog-a", "test-catalog-b"
+	RegisterPlugin(a, func() pipeline.Plugin {
+		return &relPlugin{
+			name: a,
+			caps: pipeline.PluginCapabilities{
+				Description: "A plugin",
+				Writes:      []string{"out-a"},
+			},
+		}
+	})
+	t.Cleanup(func() { UnregisterPlugin(a) })
+	RegisterPlugin(b, func() pipeline.Plugin {
+		return &relPlugin{
+			name: b,
+			caps: pipeline.PluginCapabilities{
+				Description: "B plugin",
+				Reads:       []string{"out-a"},
+				Requires:    []string{a},
+			},
+		}
+	})
+	t.Cleanup(func() { UnregisterPlugin(b) })
+
+	entries := Catalog()
+	got := map[string]pipeline.PluginCapabilities{}
+	for _, e := range entries {
+		got[e.Name] = e.Capabilities
+	}
+
+	if got[a].Description != "A plugin" {
+		t.Fatalf("Catalog missing %s with Description: %+v", a, got[a])
+	}
+	if got[b].Description != "B plugin" {
+		t.Fatalf("Catalog missing %s with Description: %+v", b, got[b])
+	}
+	if len(got[b].Requires) != 1 || got[b].Requires[0] != a {
+		t.Fatalf("Catalog %s.Requires lost: %+v", b, got[b].Requires)
+	}
+
+	// Sorted order: walk entries and confirm a < b appear in that order
+	// (relative position only — other tests may register plugins).
+	idxA, idxB := -1, -1
+	for i, e := range entries {
+		if e.Name == a {
+			idxA = i
+		}
+		if e.Name == b {
+			idxB = i
+		}
+	}
+	if idxA == -1 || idxB == -1 || idxA > idxB {
+		t.Fatalf("Catalog not sorted: a@%d b@%d", idxA, idxB)
+	}
+}
+
+// TestCatalog_FactoryInvariant locks the load-bearing claim that every
+// plugin's factory produces instances with byte-identical Capabilities().
+// Catalog() reads metadata once (from the first instance) and caches the
+// result, so a future plugin that varies Capabilities() based on instance
+// state would silently produce wrong catalog entries.
+//
+// Walks every registered plugin, calls its factory twice, and asserts the
+// two Capabilities() return values are equal. Failure points to a plugin
+// that needs to either (a) make its Capabilities() purely static, or
+// (b) split into multiple registered names per behavioral variant.
+func TestCatalog_FactoryInvariant(t *testing.T) {
+	registryMu.RLock()
+	names := make([]string, 0, len(registry))
+	for n := range registry {
+		names = append(names, n)
+	}
+	registryMu.RUnlock()
+
+	for _, name := range names {
+		name := name
+		t.Run(name, func(t *testing.T) {
+			factory, ok := factoryFor(name)
+			if !ok {
+				t.Fatalf("factory missing")
+			}
+			capsA := factory().Capabilities().Normalize()
+			capsB := factory().Capabilities().Normalize()
+			if !reflect.DeepEqual(capsA, capsB) {
+				t.Fatalf("Capabilities() differs across factory instances:\n  A: %+v\n  B: %+v",
+					capsA, capsB)
+			}
+		})
+	}
+}
+
+// TestCatalog_ReturnsDefensiveCopy verifies callers can mutate the
+// returned slice (and its nested capability slices) without tainting
+// the cached snapshot or future Catalog() reads.
+func TestCatalog_ReturnsDefensiveCopy(t *testing.T) {
+	resetCatalogCache()
+	t.Cleanup(resetCatalogCache)
+	const name = "test-defensive-copy"
+	RegisterPlugin(name, func() pipeline.Plugin {
+		return &relPlugin{name: name, caps: pipeline.PluginCapabilities{
+			Writes: []string{"slot-a"},
+		}}
+	})
+	t.Cleanup(func() { UnregisterPlugin(name) })
+
+	first := Catalog()
+	// Find our entry.
+	var idx int = -1
+	for i, e := range first {
+		if e.Name == name {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatal("seeded plugin missing from Catalog")
+	}
+
+	// Mutate the returned slice and the nested Writes slice.
+	first[idx].Capabilities.Writes[0] = "MUTATED"
+	first[idx].Capabilities.Description = "MUTATED"
+
+	// A second call must still see the original values.
+	second := Catalog()
+	var idx2 int = -1
+	for i, e := range second {
+		if e.Name == name {
+			idx2 = i
+			break
+		}
+	}
+	if idx2 < 0 {
+		t.Fatal("seeded plugin missing from second Catalog call")
+	}
+	if got := second[idx2].Capabilities.Writes[0]; got != "slot-a" {
+		t.Errorf("cache tainted by caller mutation: Writes[0] = %q, want slot-a", got)
+	}
+	if got := second[idx2].Capabilities.Description; got != "" {
+		t.Errorf("cache tainted by caller mutation: Description = %q, want empty", got)
 	}
 }

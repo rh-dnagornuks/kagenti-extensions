@@ -467,3 +467,41 @@ func TestEditFlow_StaleMsgFromAbandonedEditDropped(t *testing.T) {
 	// Quiet "cmd is unused after Edit 2 dispatch" by referencing it.
 	_ = cmd
 }
+
+// TestEditFlow_PostSpliceYAMLError verifies the post-splice YAML
+// validation: an edit that parses standalone but produces an invalid
+// combined inner YAML when spliced back routes to editPhaseError
+// before the diff phase, instead of waiting for kubelet sync to
+// surface the framework's reload error.
+func TestEditFlow_PostSpliceYAMLError(t *testing.T) {
+	runner := &editFakeRunner{getResponse: []byte(editFixtureCMYAML)}
+	m := newPickerModel(context.Background(), nil, nil)
+	m.editRunner = runner.run
+	m.statusURL = "http://stub"
+	m.selectedNamespace = "team1"
+	m.selectedPod = "email-agent"
+	m.pane = panePipeline
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	mm := updated.(*model)
+	fetchedMsg := cmd().(genFetchedMsg)
+	defer os.Remove(fetchedMsg.TempPath)
+
+	// Edit with leading whitespace on the pipeline: line. The subtree
+	// parses standalone, but splicing it back produces broken indent
+	// against the surrounding mode:/session: keys.
+	bad := []byte("  pipeline:\n    inbound:\n      - name: jwt-validation\n")
+	if err := os.WriteFile(fetchedMsg.TempPath, bad, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	updated, _ = mm.Update(fetchedMsg)
+	mm = updated.(*model)
+	updated, _ = mm.Update(editorExitedMsg{gen: mm.editState.generation, err: nil})
+	mm = updated.(*model)
+	if mm.editState.phase != editPhaseError {
+		t.Fatalf("phase = %v, want editPhaseError (post-splice YAML should fail)", mm.editState.phase)
+	}
+	if !strings.Contains(mm.editState.err, "after splice") {
+		t.Fatalf("error should mention splice; got %q", mm.editState.err)
+	}
+}

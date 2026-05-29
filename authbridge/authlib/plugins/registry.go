@@ -80,6 +80,125 @@ func RegisteredPlugins() []string {
 	return names
 }
 
+// CatalogEntry pairs a registered plugin's name with the capabilities
+// it advertises. Surfaces in `abctl`'s catalog pane and in the
+// /v1/plugins endpoint so operators can see what plugins exist and
+// what each one needs without reading source.
+type CatalogEntry struct {
+	Name         string
+	Capabilities pipeline.PluginCapabilities
+}
+
+// catalogCache memoizes the Catalog() result on first call. Constructors
+// run once at first invocation; the throwaway instance is unreferenced
+// after Capabilities() is read but never explicitly torn down.
+//
+// Caching bounds the constructor side-effect surface to a one-shot per
+// process — even a misbehaving plugin that allocates a goroutine in its
+// constructor leaks one goroutine, not one per /v1/plugins request.
+var (
+	catalogCacheMu  sync.RWMutex
+	catalogCacheVal []CatalogEntry
+)
+
+// Catalog returns a sorted snapshot of every registered plugin's
+// capabilities. The result is computed on first call and cached;
+// subsequent calls return the cached slice (do not mutate it).
+//
+// First-call mechanics: each registered factory is invoked once with no
+// config; the resulting instance's Capabilities() is the static
+// type-level metadata that the rest of the framework also reads.
+//
+// CONSTRUCTOR CONTRACT: factories called from Catalog MUST NOT allocate
+// goroutines, network connections, file handles, or other resources
+// that need explicit teardown. Allocate the plugin struct and nothing
+// more — heavy work belongs in Init() (after Configure()), where the
+// framework owns the lifecycle. The throwaway instance Catalog
+// constructs is never Shutdown'd; anything it leaks is process-wide.
+//
+// The godoc on PluginCapabilities documents the parallel constraint
+// that Capabilities() must be instance-state-independent (so the
+// cached snapshot from one instance describes every instance the
+// factory produces).
+func Catalog() []CatalogEntry {
+	catalogCacheMu.RLock()
+	if catalogCacheVal != nil {
+		out := cloneCatalog(catalogCacheVal)
+		catalogCacheMu.RUnlock()
+		return out
+	}
+	catalogCacheMu.RUnlock()
+
+	catalogCacheMu.Lock()
+	defer catalogCacheMu.Unlock()
+	if catalogCacheVal != nil { // double-check under write lock
+		return cloneCatalog(catalogCacheVal)
+	}
+
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	out := make([]CatalogEntry, 0, len(registry))
+	for name, factory := range registry {
+		out = append(out, CatalogEntry{
+			Name:         name,
+			Capabilities: factory().Capabilities().Normalize(),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	catalogCacheVal = out
+	return cloneCatalog(out)
+}
+
+// cloneCatalog returns a deep copy of in: each CatalogEntry is copied
+// and every []string field on its Capabilities is freshly allocated.
+// Catalog returns a clone so callers can mutate the slice (sort, filter,
+// extend per-entry slices) without tainting the cached snapshot — and
+// without that tainted view leaking into future /v1/plugins responses.
+func cloneCatalog(in []CatalogEntry) []CatalogEntry {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]CatalogEntry, len(in))
+	for i := range in {
+		caps := in[i].Capabilities
+		out[i] = CatalogEntry{
+			Name: in[i].Name,
+			Capabilities: pipeline.PluginCapabilities{
+				ReadsBody:   caps.ReadsBody,
+				WritesBody:  caps.WritesBody,
+				BodyAccess:  caps.BodyAccess,
+				Description: caps.Description,
+				Writes:      append([]string(nil), caps.Writes...),
+				Reads:       append([]string(nil), caps.Reads...),
+				Requires:    append([]string(nil), caps.Requires...),
+				RequiresAny: append([]string(nil), caps.RequiresAny...),
+				After:       append([]string(nil), caps.After...),
+				Claims:      append([]string(nil), caps.Claims...),
+			},
+		}
+	}
+	return out
+}
+
+// resetCatalogCache clears the memoized Catalog result. Intended for
+// tests that register/unregister plugins and need a fresh view.
+func resetCatalogCache() {
+	catalogCacheMu.Lock()
+	catalogCacheVal = nil
+	catalogCacheMu.Unlock()
+}
+
+// WarmCatalog triggers Catalog() at boot so any plugin whose factory
+// violates the constructor contract (panics, allocates goroutines /
+// connections / file handles) surfaces during startup rather than
+// silently caching a faulty throwaway instance on the first /v1/plugins
+// request. Cheap insurance — the result is already memoized, so calling
+// this at boot moves "first call" out of the request hot path.
+//
+// Intended for the binary's main() to invoke once after all plugin
+// init() registrations have run (typically right before sessionapi.New).
+func WarmCatalog() { _ = Catalog() }
+
 // factoryFor looks up a factory by name. Internal to the package.
 // Callers under Build use this to resolve config entries into plugin
 // instances.

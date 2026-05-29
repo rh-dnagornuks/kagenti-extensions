@@ -36,7 +36,14 @@ const (
 	paneDetail
 	panePipeline
 	panePluginDetail
+	paneCatalog
 )
+
+// paneNone is the explicit "no previous pane recorded" sentinel for
+// model.previousPane. Using paneNamespaces (the zero value) as a
+// sentinel would conflict with a future feature that wanted to open
+// the catalog from the picker. -1 is unambiguous.
+const paneNone paneID = -1
 
 // Connection state for the SSE stream.
 type connPhase int
@@ -206,6 +213,7 @@ type model struct {
 	sessionsTbl  table.Model
 	eventsTbl    table.Model
 	pipelineTbl  table.Model
+	catalogTbl   table.Model
 	detailVp     viewport.Model
 	detailEvent  *pipeline.SessionEvent
 	detailPlugin *apiclient.PipelinePlugin
@@ -221,6 +229,15 @@ type model struct {
 	// GetPipeline response arrives; the pipeline pane shows "(loading…)"
 	// until then.
 	pipeline *apiclient.PipelineView
+
+	// catalog is the registered-plugin catalog from /v1/plugins,
+	// fetched lazily when the user first opens the catalog pane via
+	// `P`. Cached for the session; `r` from the catalog pane refreshes.
+	// nil before the first fetch; the catalog pane shows "(loading…)".
+	catalog *apiclient.PluginCatalog
+	// previousPane lets `Esc` from the catalog pane return to whichever
+	// pane the user came from instead of always defaulting to one.
+	previousPane paneID
 
 	// streamCh is the single SSE channel from the apiclient. Opened once
 	// in Init; re-pumped on every streamMsg until it closes.
@@ -272,19 +289,21 @@ func New(ctx context.Context, c *apiclient.Client) tea.Model {
 	ti.Prompt = "/ "
 
 	return &model{
-		endpoint:    c.Endpoint(),
-		client:      c,
-		ctx:         ctx,
-		cancel:      cancel,
-		events:      make(map[string][]pipeline.SessionEvent),
-		pane:        paneSessions,
-		sessionsTbl: newSessionsTable(),
-		eventsTbl:   newEventsTable(),
-		pipelineTbl: newPipelineTable(),
-		detailVp:    viewport.New(0, 0),
-		filterInput: ti,
-		lastTick:    time.Now(),
-		connState:   connStateInfo{phase: connConnecting},
+		endpoint:     c.Endpoint(),
+		client:       c,
+		ctx:          ctx,
+		cancel:       cancel,
+		events:       make(map[string][]pipeline.SessionEvent),
+		pane:         paneSessions,
+		sessionsTbl:  newSessionsTable(),
+		eventsTbl:    newEventsTable(),
+		pipelineTbl:  newPipelineTable(),
+		catalogTbl:   newCatalogTable(),
+		previousPane: paneNone,
+		detailVp:     viewport.New(0, 0),
+		filterInput:  ti,
+		lastTick:     time.Now(),
+		connState:    connStateInfo{phase: connConnecting},
 	}
 }
 
@@ -328,6 +347,12 @@ func (m *model) backToPodsPane() {
 	m.rate = 0
 	m.drops = 0
 	m.pipeline = nil
+	// Drop the cached /v1/plugins snapshot too — a different pod is a
+	// different framework instance with potentially different plugin
+	// versions registered. The next `P` press refetches.
+	m.catalog = nil
+	m.catalogTbl.SetRows(nil)
+	m.previousPane = paneNone
 	m.detailEvent = nil
 	m.detailPlugin = nil
 	m.selectedSess = ""
@@ -362,6 +387,24 @@ func (m *model) loadPipelineCmd() tea.Cmd {
 			return errMsg{where: "get pipeline", err: err}
 		}
 		return pipelineLoadedMsg(pv)
+	}
+}
+
+// catalogLoadedMsg carries the result of /v1/plugins. Distinct from
+// pipelineLoadedMsg because the catalog is the registered set, not
+// the active chain.
+type catalogLoadedMsg struct {
+	catalog *apiclient.PluginCatalog
+	err     error
+}
+
+// loadCatalogCmd fetches /v1/plugins. Called lazily when the user
+// presses `P` to enter the catalog pane; the result is cached on the
+// model and refreshed on demand.
+func (m *model) loadCatalogCmd() tea.Cmd {
+	return func() tea.Msg {
+		cat, err := m.client.GetPluginCatalog(m.ctx)
+		return catalogLoadedMsg{catalog: cat, err: err}
 	}
 }
 
@@ -478,6 +521,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case pipelineLoadedMsg:
 		m.pipeline = (*apiclient.PipelineView)(msg)
 		m.rebuildPipelineTable()
+		return m, nil
+
+	case catalogLoadedMsg:
+		if msg.err != nil {
+			m.setFlash("catalog fetch failed: " + msg.err.Error())
+			return m, nil
+		}
+		m.catalog = msg.catalog
+		m.rebuildCatalogTable()
 		return m, nil
 
 	case snapshotLoadedMsg:
@@ -624,6 +676,33 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.editState.err = "invalid YAML: " + err.Error()
 			return m, nil
 		}
+		// The user's edited subtree parses standalone, but the framework
+		// loads the WHOLE inner YAML. An indentation mismatch between
+		// the user's edit and the splice site can produce a subtree that
+		// parses on its own yet breaks the combined doc. Splice + reparse
+		// to catch that here, instead of after a 60s kubelet round-trip.
+		previewInner := edit.Splice(
+			m.editState.fetched.InnerYAML,
+			m.editState.fetched.PipelineStart,
+			m.editState.fetched.PipelineEnd,
+			edited,
+		)
+		var combinedVal any
+		if err := yaml.Unmarshal(previewInner, &combinedVal); err != nil {
+			m.editState.phase = editPhaseError
+			m.editState.err = "invalid YAML after splice: " + err.Error() +
+				"\n(probably an indentation mismatch — the pipeline: subtree must start at column 0)"
+			return m, nil
+		}
+		// Pre-apply validation against the catalog. Skipped silently
+		// when the catalog hasn't been fetched yet (operator hasn't
+		// pressed P); the framework's validateRelationships is the
+		// source of truth and runs again on reload regardless.
+		var catalog []apiclient.PluginCatalogEntry
+		if m.catalog != nil {
+			catalog = m.catalog.Plugins
+		}
+		m.editState.validationErrs = edit.ValidatePipeline(edited, catalog)
 		m.editState.diff = edit.Diff(originalSubtree, edited)
 		m.editState.phase = editPhaseDiff
 		return m, nil
@@ -879,6 +958,15 @@ func (m *model) View() string {
 		}
 		title = fmt.Sprintf("abctl · pipeline · %s", name)
 		body = m.detailVp.View()
+	case paneCatalog:
+		title = fmt.Sprintf("abctl · %s · catalog", m.endpoint)
+		if m.catalog == nil {
+			body = styleHint.Render("(loading catalog…)")
+		} else if len(m.catalog.Plugins) == 0 {
+			body = styleHint.Render("(no registered plugins reported by /v1/plugins)")
+		} else {
+			body = m.catalogTbl.View()
+		}
 	}
 
 	header := styleTitle.Render(title)

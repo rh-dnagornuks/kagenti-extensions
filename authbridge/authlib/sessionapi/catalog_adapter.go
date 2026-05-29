@@ -1,0 +1,32 @@
+package sessionapi
+
+import "github.com/kagenti/kagenti-extensions/authbridge/authlib/plugins"
+
+// PluginsCatalog adapts plugins.Catalog() into the wire-shaped
+// CatalogEntry slice WithCatalog expects. Three binaries (authbridge-
+// proxy, -envoy, -lite) plug it in identically; centralizing the
+// conversion here keeps the field list one-place.
+//
+// Direction is left empty: the catalog describes plugin TYPES, and
+// most plugins can be configured into either chain (parsers especially).
+// abctl renders direction only for the active pipeline, where the
+// answer is positional, not type-level.
+func PluginsCatalog() []CatalogEntry {
+	src := plugins.Catalog()
+	out := make([]CatalogEntry, len(src))
+	for i, e := range src {
+		n := e.Capabilities.Normalize()
+		out[i] = CatalogEntry{
+			Name:        e.Name,
+			ReadsBody:   n.ReadsBody,
+			Writes:      n.Writes,
+			Reads:       n.Reads,
+			Requires:    n.Requires,
+			RequiresAny: n.RequiresAny,
+			After:       n.After,
+			Claims:      n.Claims,
+			Description: n.Description,
+		}
+	}
+	return out
+}

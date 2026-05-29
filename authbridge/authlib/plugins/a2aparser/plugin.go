@@ -26,8 +26,9 @@ func (p *A2AParser) Name() string { return "a2a-parser" }
 
 func (p *A2AParser) Capabilities() pipeline.PluginCapabilities {
 	return pipeline.PluginCapabilities{
-		Writes:    []string{"a2a"},
-		ReadsBody: true,
+		Writes:      []string{"a2a"},
+		ReadsBody:   true,
+		Description: "Parses A2A messages into pctx.Extensions.A2A for downstream plugins.",
 	}
 }
 
@@ -109,10 +110,19 @@ func (p *A2AParser) OnRequest(_ context.Context, pctx *pipeline.Context) pipelin
 //
 // Handles both JSON-RPC responses (message/send) and SSE event streams (message/stream).
 func (p *A2AParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeline.Action {
-	// No Invocation on response when the parser doesn't apply: either
-	// there's no response body or the matching request wasn't an A2A
-	// JSON-RPC call. Keeps the response event clean for non-A2A traffic.
-	if len(pctx.ResponseBody) == 0 || pctx.Extensions.A2A == nil {
+	// Stay silent when the request side never participated — the parser
+	// recorded nothing on request, so recording on response would orphan
+	// the row.
+	if pctx.Extensions.A2A == nil {
+		return pipeline.Action{Type: pipeline.Continue}
+	}
+	// We DID process the request but the response has no body — record
+	// a Skip so abctl can pair the response row with the request row.
+	// Without this, the request invocation orphans and the events table
+	// shows req+resp as unpaired (no ┌/└ glyphs, plugin/action columns
+	// blank on the response side).
+	if len(pctx.ResponseBody) == 0 {
+		pctx.Skip("no_response_body")
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 

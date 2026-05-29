@@ -83,13 +83,18 @@ type PipelineView struct {
 // PipelinePlugin describes one plugin's position, direction, and
 // capabilities. Mirrors the server's pipelinePluginView exactly.
 type PipelinePlugin struct {
-	Name       string          `json:"name"`
-	Direction  string          `json:"direction"`
-	Position   int             `json:"position"`
-	BodyAccess bool            `json:"bodyAccess"`
-	Writes     []string        `json:"writes"`
-	Reads      []string        `json:"reads"`
-	Config     json.RawMessage `json:"config,omitempty"`
+	Name        string          `json:"name"`
+	Direction   string          `json:"direction"`
+	Position    int             `json:"position"`
+	BodyAccess  bool            `json:"bodyAccess"`
+	Writes      []string        `json:"writes"`
+	Reads       []string        `json:"reads"`
+	Requires    []string        `json:"requires,omitempty"`
+	RequiresAny []string        `json:"requiresAny,omitempty"`
+	After       []string        `json:"after,omitempty"`
+	Claims      []string        `json:"claims,omitempty"`
+	Description string          `json:"description,omitempty"`
+	Config      json.RawMessage `json:"config,omitempty"`
 }
 
 // GetPipeline fetches /v1/pipeline.
@@ -99,6 +104,42 @@ func (c *Client) GetPipeline(ctx context.Context) (*PipelineView, error) {
 		return nil, err
 	}
 	return &view, nil
+}
+
+// PluginCatalog is the decoded shape of GET /v1/plugins.
+type PluginCatalog struct {
+	Plugins []PluginCatalogEntry `json:"plugins"`
+}
+
+// PluginCatalogEntry mirrors the server's sessionapi.CatalogEntry.
+// Describes a registered plugin's static type-level metadata; the
+// catalog includes plugins not currently in the active pipeline.
+//
+// readsBody is the modern field name (matches pipeline.PluginCapabilities
+// post-Normalize); the older bodyAccess alias is intentionally NOT
+// emitted on this new wire shape.
+type PluginCatalogEntry struct {
+	Name        string   `json:"name"`
+	Direction   string   `json:"direction,omitempty"`
+	ReadsBody   bool     `json:"readsBody,omitempty"`
+	Writes      []string `json:"writes,omitempty"`
+	Reads       []string `json:"reads,omitempty"`
+	Requires    []string `json:"requires,omitempty"`
+	RequiresAny []string `json:"requiresAny,omitempty"`
+	After       []string `json:"after,omitempty"`
+	Claims      []string `json:"claims,omitempty"`
+	Description string   `json:"description,omitempty"`
+}
+
+// GetPluginCatalog fetches /v1/plugins. Returns ErrNotFound when the
+// server is too old to serve the endpoint (no WithCatalog option) so
+// callers can degrade gracefully.
+func (c *Client) GetPluginCatalog(ctx context.Context) (*PluginCatalog, error) {
+	var cat PluginCatalog
+	if err := c.getJSON(ctx, "/v1/plugins", &cat); err != nil {
+		return nil, err
+	}
+	return &cat, nil
 }
 
 func (c *Client) getJSON(ctx context.Context, path string, out any) error {

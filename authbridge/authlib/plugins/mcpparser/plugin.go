@@ -26,8 +26,9 @@ func (p *MCPParser) Name() string { return "mcp-parser" }
 
 func (p *MCPParser) Capabilities() pipeline.PluginCapabilities {
 	return pipeline.PluginCapabilities{
-		Writes:    []string{"mcp"},
-		ReadsBody: true,
+		Writes:      []string{"mcp"},
+		ReadsBody:   true,
+		Description: "Parses MCP tool calls/results into pctx.Extensions.MCP.",
 	}
 }
 
@@ -70,12 +71,19 @@ func (p *MCPParser) OnRequest(_ context.Context, pctx *pipeline.Context) pipelin
 }
 
 func (p *MCPParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeline.Action {
-	// No Invocation when the parser doesn't apply — request wasn't MCP
-	// JSON-RPC or no response body to parse. The unparseable_response
-	// case below IS recorded because it's diagnostic: the request WAS
-	// MCP but the response couldn't be decoded, which usually signals
-	// an upstream protocol bug worth surfacing.
-	if len(pctx.ResponseBody) == 0 || pctx.Extensions.MCP == nil {
+	// Stay silent when the request side never participated — the parser
+	// recorded nothing on request, so recording on response would orphan
+	// the row.
+	if pctx.Extensions.MCP == nil {
+		return pipeline.Action{Type: pipeline.Continue}
+	}
+	// We DID process the request but the response has no body — typical
+	// for JSON-RPC notifications that ack with HTTP 202. Record a Skip
+	// so abctl can pair the response row with the request row in the
+	// timeline (pairing keys on plugin+method+direction; an empty
+	// invocation slot orphans both ends).
+	if len(pctx.ResponseBody) == 0 {
+		pctx.Skip("no_response_body")
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 

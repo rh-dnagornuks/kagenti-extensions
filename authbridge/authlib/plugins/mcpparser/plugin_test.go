@@ -201,10 +201,12 @@ func TestMCPParser_MissingParams(t *testing.T) {
 }
 
 func TestMCPParser_OnResponse_NoRequestContext(t *testing.T) {
-	// If the request phase never ran (no MCP extension populated), OnResponse
-	// should skip — there's nothing to correlate the response to.
+	// Request phase didn't run (no MCP extension populated): OnResponse
+	// stays silent — no Invocation recorded — so the response event
+	// doesn't appear as an MCP row at all.
 	p := NewMCPParser()
 	pctx := &pipeline.Context{
+		Direction:    pipeline.Outbound,
 		ResponseBody: []byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`),
 	}
 	action := p.OnResponse(context.Background(), pctx)
@@ -214,12 +216,23 @@ func TestMCPParser_OnResponse_NoRequestContext(t *testing.T) {
 	if pctx.Extensions.MCP != nil {
 		t.Error("MCP extension should remain nil when request was not parsed")
 	}
+	if pctx.Extensions.Invocations != nil &&
+		(len(pctx.Extensions.Invocations.Inbound)+len(pctx.Extensions.Invocations.Outbound)) > 0 {
+		t.Errorf("non-MCP response should not record any Invocation; got %+v",
+			pctx.Extensions.Invocations)
+	}
 }
 
+// TestMCPParser_OnResponse_EmptyBody is the regression test for the
+// notifications/initialized pairing bug: when the request side parsed
+// the message (Extensions.MCP populated) but the response body is empty
+// (HTTP 202 ack), the parser must record a Skip so abctl can pair the
+// response row with the request row in the events timeline.
 func TestMCPParser_OnResponse_EmptyBody(t *testing.T) {
 	p := NewMCPParser()
 	pctx := &pipeline.Context{
-		Extensions: pipeline.Extensions{MCP: &pipeline.MCPExtension{Method: "tools/list"}},
+		Direction:  pipeline.Outbound,
+		Extensions: pipeline.Extensions{MCP: &pipeline.MCPExtension{Method: "notifications/initialized"}},
 	}
 	action := p.OnResponse(context.Background(), pctx)
 	if action.Type != pipeline.Continue {
@@ -227,6 +240,19 @@ func TestMCPParser_OnResponse_EmptyBody(t *testing.T) {
 	}
 	if pctx.Extensions.MCP.Result != nil {
 		t.Error("Result should remain nil when response body is empty")
+	}
+	if pctx.Extensions.Invocations == nil {
+		t.Fatal("expected a Skip Invocation, got none")
+	}
+	invs := pctx.Extensions.Invocations.Outbound
+	if len(invs) != 1 {
+		t.Fatalf("expected 1 Invocation, got %d", len(invs))
+	}
+	if invs[0].Action != pipeline.ActionSkip {
+		t.Errorf("Action = %q, want skip", invs[0].Action)
+	}
+	if invs[0].Reason != "no_response_body" {
+		t.Errorf("Reason = %q, want no_response_body", invs[0].Reason)
 	}
 }
 

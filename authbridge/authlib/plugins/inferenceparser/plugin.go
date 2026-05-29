@@ -26,8 +26,9 @@ func (p *InferenceParser) Name() string { return "inference-parser" }
 
 func (p *InferenceParser) Capabilities() pipeline.PluginCapabilities {
 	return pipeline.PluginCapabilities{
-		Writes:    []string{"inference"},
-		ReadsBody: true,
+		Writes:      []string{"inference"},
+		ReadsBody:   true,
+		Description: "Parses LLM completions into pctx.Extensions.Inference.",
 	}
 }
 
@@ -95,9 +96,16 @@ func (p *InferenceParser) OnRequest(_ context.Context, pctx *pipeline.Context) p
 // token counts) on pctx.Extensions.Inference. Handles both non-streaming
 // JSON responses and SSE streams from OpenAI-compatible servers.
 func (p *InferenceParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeline.Action {
-	// No Invocation when the parser doesn't apply — request wasn't
-	// inference or no response body to parse.
-	if len(pctx.ResponseBody) == 0 || pctx.Extensions.Inference == nil {
+	// Stay silent when the request side never participated — the parser
+	// recorded nothing on request, so recording on response would orphan
+	// the row.
+	if pctx.Extensions.Inference == nil {
+		return pipeline.Action{Type: pipeline.Continue}
+	}
+	// We DID process the request but the response has no body — record
+	// a Skip so abctl can pair the response row with the request row.
+	if len(pctx.ResponseBody) == 0 {
+		pctx.Skip("no_response_body")
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 
