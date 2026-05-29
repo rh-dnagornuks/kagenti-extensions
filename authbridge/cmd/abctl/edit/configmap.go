@@ -97,7 +97,15 @@ func FindPipelineRange(innerYAML []byte) (start, end int, err error) {
 // and returns the result. Used to apply the user's edit to just the pipeline
 // subtree, leaving everything outside it byte-for-byte unchanged. Comments,
 // blank lines, and field ordering outside the pipeline subtree all survive.
+//
+// Returns innerYAML unchanged if start/end fall outside [0, len(innerYAML)]
+// or if start > end. Callers normally derive offsets from FindPipelineRange
+// on the same bytes, but the guard keeps the public API safe against
+// mismatched callers (e.g. stale offsets after a mutation).
 func Splice(innerYAML []byte, start, end int, newSubtree []byte) []byte {
+	if start < 0 || end > len(innerYAML) || start > end {
+		return innerYAML
+	}
 	var b bytes.Buffer
 	b.Grow(len(innerYAML) - (end - start) + len(newSubtree))
 	b.Write(innerYAML[:start])
@@ -169,6 +177,8 @@ func BuildManifest(origCMYAML, newInner []byte) ([]byte, error) {
 		if md.Kind != yaml.MappingNode {
 			break
 		}
+		// Reuse the backing array — we only ever shrink (drop pairs), never
+		// grow, so aliasing the original slice is safe and avoids an alloc.
 		stripped := md.Content[:0]
 		for j := 0; j < len(md.Content); j += 2 {
 			k := md.Content[j].Value

@@ -380,6 +380,26 @@ func TestResolveAgentName_FallbackToPodSuffixStrip(t *testing.T) {
 	}
 }
 
+func TestSplice_OutOfBoundsReturnsInputUnchanged(t *testing.T) {
+	in := []byte("abc\ndef\n")
+	cases := []struct {
+		name       string
+		start, end int
+	}{
+		{"negative start", -1, 4},
+		{"end past len", 0, 9999},
+		{"start > end", 5, 2},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Splice(in, c.start, c.end, []byte("X"))
+			if string(got) != string(in) {
+				t.Fatalf("want input back unchanged, got %q", got)
+			}
+		})
+	}
+}
+
 // equalArgs checks two []string for equality.
 func equalArgs(a, b []string) bool {
 	if len(a) != len(b) {
