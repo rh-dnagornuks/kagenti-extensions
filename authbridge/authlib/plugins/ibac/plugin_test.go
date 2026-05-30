@@ -540,7 +540,9 @@ func TestOnRequest_TransportStreamBypass_GETWithBodyIsJudged(t *testing.T) {
 // Body-less POST/PUT/DELETE/PATCH must NOT bypass — the absence of
 // body alone isn't enough; the method must signal "retrieval" too.
 // A body-less POST is unusual but legal (semantic "do action") and
-// IBAC should still judge it.
+// IBAC should still judge it. (Body-less DELETE *with* the
+// Mcp-Session-Id header is its own special case — see
+// TestOnRequest_TransportStream_MCPSessionTerminate.)
 func TestOnRequest_TransportStreamBypass_BodylessPOSTIsJudged(t *testing.T) {
 	for _, method := range []string{"POST", "PUT", "DELETE", "PATCH"} {
 		t.Run(method, func(t *testing.T) {
@@ -558,6 +560,67 @@ func TestOnRequest_TransportStreamBypass_BodylessPOSTIsJudged(t *testing.T) {
 				t.Errorf("judge calls = %d, want 1 for body-less %s", fj.calls, method)
 			}
 		})
+	}
+}
+
+// MCP Streamable HTTP session termination: DELETE to the MCP
+// endpoint with the Mcp-Session-Id header. Per spec, MCP clients
+// send this at end-of-conversation to release server-side session
+// state. It carries no payload and no user-actionable intent —
+// must bypass the judge with reason "transport_stream".
+//
+// Without this bypass, the judge sees "DELETE http://...mcp" with
+// an empty body and reasonably (but wrongly) responds along the
+// lines of "Action involves deleting data, which is not strictly
+// necessary for user intent" — a 403 on routine protocol cleanup
+// at end-of-conversation.
+func TestOnRequest_TransportStream_MCPSessionTerminate(t *testing.T) {
+	fj := &fakeJudge{}
+	p := newConfiguredIBAC(t, fj)
+
+	pctx := makePCtx(t)
+	pctx.Method = "DELETE"
+	pctx.Host = "exgentic-mcp-gsm8k-mcp:8000"
+	pctx.Path = "/mcp"
+	pctx.Body = nil
+	pctx.Headers.Set("Mcp-Session-Id", "abc-123")
+	action := invokeOnRequest(p, pctx)
+
+	if action.Type != pipeline.Continue {
+		t.Errorf("got %v, want Continue for MCP session terminate", action.Type)
+	}
+	if fj.calls != 0 {
+		t.Errorf("judge calls = %d, want 0 (session terminate must not reach judge)", fj.calls)
+	}
+	inv := lastInvocation(t, pctx)
+	if inv.Action != pipeline.ActionSkip {
+		t.Errorf("Invocation action = %v, want ActionSkip", inv.Action)
+	}
+	if inv.Reason != "transport_stream" {
+		t.Errorf("Invocation reason = %q, want 'transport_stream'", inv.Reason)
+	}
+}
+
+// Body-less DELETE WITHOUT the Mcp-Session-Id header must still be
+// judged. A real "delete this resource" call (e.g. DELETE /api/
+// users/42) carries no MCP session header and is exactly the kind
+// of side-effect action IBAC exists to evaluate. The header is the
+// load-bearing distinguisher between transport cleanup and a user-
+// meaningful delete.
+func TestOnRequest_TransportStream_BodylessDELETEWithoutHeaderIsJudged(t *testing.T) {
+	fj := &fakeJudge{verdict: "allow"}
+	p := newConfiguredIBAC(t, fj)
+
+	pctx := makePCtx(t)
+	pctx.Method = "DELETE"
+	pctx.Host = "api.example.com"
+	pctx.Path = "/api/users/42"
+	pctx.Body = nil
+	// no Mcp-Session-Id header
+	_ = invokeOnRequest(p, pctx)
+
+	if fj.calls != 1 {
+		t.Errorf("judge calls = %d, want 1 (real DELETE without MCP header must be judged)", fj.calls)
 	}
 }
 

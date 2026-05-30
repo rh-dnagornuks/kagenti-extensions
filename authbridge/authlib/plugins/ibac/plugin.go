@@ -303,20 +303,33 @@ func (p *IBAC) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 
-	// 5b. Transport-stream bypass. Body-less retrieval-shaped requests
-	//     carry no action payload to evaluate — typical patterns: MCP
-	//     Streamable HTTP's server→client SSE channel (GET), agent-
-	//     card fetches (GET), OAuth metadata probes (GET), CORS
-	//     preflights (OPTIONS), HEAD probes for cache validation /
-	//     existence checks. Sending these to the judge is a category
-	//     error: there's nothing to judge, and the LLM either denies
-	//     for lack of context or returns a non-deterministic verdict
-	//     that depends on noise in the prompt.
+	// 5b. Transport-stream bypass. Two patterns of requests carry no
+	//     user-meaningful action and must skip the judge:
 	//
-	//     Threat model: an attacker can't smuggle a payload through a
-	//     body-less GET/HEAD/OPTIONS — there's no request body to put
-	//     the action in. Side-effect HTTP methods (POST/PUT/DELETE/
-	//     PATCH) always reach the judge, body-having or not.
+	//       - Body-less GET/HEAD/OPTIONS: retrieval-shaped calls
+	//         (MCP Streamable HTTP server→client SSE channel-open,
+	//         agent-card fetches, OAuth metadata probes, CORS
+	//         preflights, HEAD existence/cache-validation probes).
+	//
+	//       - Body-less DELETE with the Mcp-Session-Id header: MCP
+	//         Streamable HTTP session termination, sent by the MCP
+	//         client SDK at end-of-conversation to release server-
+	//         side session state. The header is set by the SDK, not
+	//         user input, so it's a precise distinguisher from a
+	//         "DELETE /api/users/42" real-action call.
+	//
+	//     Sending either to the judge is a category error: there's
+	//     nothing to judge, and the LLM either denies for lack of
+	//     context or misinterprets the verb (e.g. correctly noting
+	//     "DELETE involves deleting data" without knowing it's
+	//     protocol session cleanup).
+	//
+	//     Threat model: an attacker can't smuggle a payload through
+	//     a body-less request — there's no body to put it in. Side-
+	//     effect HTTP methods (POST/PUT/DELETE/PATCH) always reach
+	//     the judge when they carry a body. Body-less DELETE without
+	//     the Mcp-Session-Id header — a real "delete this resource"
+	//     call by URL path — also reaches the judge.
 	//
 	//     Caveat: servers that handle side-effect operations through
 	//     GET query strings (e.g. ?action=delete&id=42) violate REST
@@ -325,7 +338,7 @@ func (p *IBAC) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 	//     plugin trusts HTTP method semantics as a proxy for "is this
 	//     an action?", and a server that breaks that convention is
 	//     making its own authorization promises that IBAC can't see.
-	if isTransportRetrieval(pctx.Method) && len(pctx.Body) == 0 {
+	if isTransportShaped(pctx) {
 		pctx.Skip("transport_stream")
 		return pipeline.Action{Type: pipeline.Continue}
 	}
@@ -609,6 +622,33 @@ func isMCPHousekeeping(method string) bool {
 func isTransportRetrieval(method string) bool {
 	switch method {
 	case "GET", "HEAD", "OPTIONS":
+		return true
+	}
+	return false
+}
+
+// isTransportShaped reports whether a request matches a transport-
+// layer pattern that carries no user-meaningful action — should be
+// skipped before the intent check. Combines two body-less shapes:
+//
+//   - retrieval (GET / HEAD / OPTIONS): see isTransportRetrieval.
+//   - MCP Streamable HTTP session termination: DELETE with the
+//     Mcp-Session-Id header. The MCP spec defines this as the way
+//     a client releases server-side session state at end-of-
+//     conversation; the header is set by the client SDK, not user
+//     input, so it's a precise distinguisher from a real
+//     "DELETE /api/resource" action call.
+//
+// A request with a non-empty body is always treated as an action,
+// regardless of method.
+func isTransportShaped(pctx *pipeline.Context) bool {
+	if len(pctx.Body) > 0 {
+		return false
+	}
+	if isTransportRetrieval(pctx.Method) {
+		return true
+	}
+	if pctx.Method == "DELETE" && pctx.Headers.Get("Mcp-Session-Id") != "" {
 		return true
 	}
 	return false
