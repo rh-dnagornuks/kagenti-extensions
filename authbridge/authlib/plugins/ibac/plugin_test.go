@@ -377,40 +377,47 @@ func TestOnRequest_MCPToolsCallIsNotHousekeeping(t *testing.T) {
 	}
 }
 
-// Body-less GET requests (MCP Streamable HTTP SSE channel, agent-card
-// fetches, OAuth metadata probes) carry no action payload and must
-// bypass the judge with reason "transport_stream". Without this, the
-// MCP client's SSE channel-open keeps getting 403'd, the connection
-// dies, and the agent loops on reconnect.
-func TestOnRequest_TransportStreamBypass_BodylessGET(t *testing.T) {
-	fj := &fakeJudge{}
-	p := newConfiguredIBAC(t, fj)
+// Body-less retrieval-shaped requests (MCP Streamable HTTP SSE channel,
+// agent-card fetches, OAuth metadata probes, CORS preflights, HEAD
+// probes) carry no action payload and must bypass the judge with reason
+// "transport_stream". Without this, the MCP client's SSE channel-open
+// keeps getting 403'd, the connection dies, and the agent loops on
+// reconnect. Covers GET, HEAD, OPTIONS — all share the body-less
+// retrieval semantics per RFC 9110.
+func TestOnRequest_TransportStreamBypass_BodylessRetrieval(t *testing.T) {
+	for _, method := range []string{"GET", "HEAD", "OPTIONS"} {
+		t.Run(method, func(t *testing.T) {
+			fj := &fakeJudge{}
+			p := newConfiguredIBAC(t, fj)
 
-	pctx := makePCtx(t)
-	pctx.Session = nil // bypass must fire before the session check
-	pctx.Method = "GET"
-	pctx.Host = "exgentic-mcp-gsm8k-mcp:8000"
-	pctx.Path = "/mcp"
-	pctx.Body = nil
-	action := invokeOnRequest(p, pctx)
+			pctx := makePCtx(t)
+			pctx.Session = nil // bypass must fire before the session check
+			pctx.Method = method
+			pctx.Host = "exgentic-mcp-gsm8k-mcp:8000"
+			pctx.Path = "/mcp"
+			pctx.Body = nil
+			action := invokeOnRequest(p, pctx)
 
-	if action.Type != pipeline.Continue {
-		t.Errorf("got %v, want Continue for body-less GET", action.Type)
-	}
-	if fj.calls != 0 {
-		t.Errorf("judge calls = %d, want 0 (body-less GET must not reach judge)", fj.calls)
-	}
-	inv := lastInvocation(t, pctx)
-	if inv.Action != pipeline.ActionSkip {
-		t.Errorf("Invocation action = %v, want ActionSkip", inv.Action)
-	}
-	if inv.Reason != "transport_stream" {
-		t.Errorf("Invocation reason = %q, want 'transport_stream'", inv.Reason)
+			if action.Type != pipeline.Continue {
+				t.Errorf("got %v, want Continue for body-less %s", action.Type, method)
+			}
+			if fj.calls != 0 {
+				t.Errorf("judge calls = %d, want 0 (body-less %s must not reach judge)", fj.calls, method)
+			}
+			inv := lastInvocation(t, pctx)
+			if inv.Action != pipeline.ActionSkip {
+				t.Errorf("Invocation action = %v, want ActionSkip", inv.Action)
+			}
+			if inv.Reason != "transport_stream" {
+				t.Errorf("Invocation reason = %q, want 'transport_stream'", inv.Reason)
+			}
+		})
 	}
 }
 
-// Body-having GETs (rare, but legal — e.g. some search APIs) must
-// still reach the judge: the body is the action.
+// Body-having retrieval-shaped requests (rare, but legal — e.g. some
+// search APIs accept GET with a JSON body) must still reach the judge:
+// the body is the action.
 func TestOnRequest_TransportStreamBypass_GETWithBodyIsJudged(t *testing.T) {
 	fj := &fakeJudge{verdict: "allow"}
 	p := newConfiguredIBAC(t, fj)
@@ -448,6 +455,34 @@ func TestOnRequest_TransportStreamBypass_BodylessPOSTIsJudged(t *testing.T) {
 				t.Errorf("judge calls = %d, want 1 for body-less %s", fj.calls, method)
 			}
 		})
+	}
+}
+
+// describeAction's first non-empty token must be the HTTP method, with
+// no leading whitespace. This locks in the listener-side pctx.Method
+// wiring contract: if any listener regresses to leaving Method empty,
+// describeAction renders " http://..." (note the leading space) and
+// the judge sees a malformed prompt while operators see a confusing
+// session-event display. The visible-symptom test catches that here
+// rather than relying on the listener-package tests alone.
+func TestOnRequest_DescribeActionHasNoLeadingWhitespace(t *testing.T) {
+	fj := &fakeJudge{verdict: "allow"}
+	p := newConfiguredIBAC(t, fj)
+
+	pctx := makePCtx(t) // POST + body, will be judged
+	_ = invokeOnRequest(p, pctx)
+
+	if fj.calls != 1 {
+		t.Fatalf("expected judge to be called once; got calls=%d", fj.calls)
+	}
+	if fj.gotAction == "" {
+		t.Fatal("describeAction was empty; cannot assert format")
+	}
+	if first := fj.gotAction[0]; first == ' ' || first == '\t' || first == '\n' {
+		t.Errorf("describeAction starts with whitespace (listener Method regression?); got %q", fj.gotAction)
+	}
+	if !strings.HasPrefix(fj.gotAction, "POST ") {
+		t.Errorf("describeAction should start with 'POST '; got %q", fj.gotAction)
 	}
 }
 

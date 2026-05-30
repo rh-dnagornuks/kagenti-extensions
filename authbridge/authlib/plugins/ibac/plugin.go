@@ -261,17 +261,29 @@ func (p *IBAC) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 		return pipeline.Action{Type: pipeline.Continue}
 	}
 
-	// 5b. Transport-stream bypass. Body-less GET requests carry no
-	//     action payload to evaluate — typical patterns: MCP Streamable
-	//     HTTP's server→client SSE channel, agent-card fetches, OAuth
-	//     metadata probes. Sending these to the judge is a category
+	// 5b. Transport-stream bypass. Body-less retrieval-shaped requests
+	//     carry no action payload to evaluate — typical patterns: MCP
+	//     Streamable HTTP's server→client SSE channel (GET), agent-
+	//     card fetches (GET), OAuth metadata probes (GET), CORS
+	//     preflights (OPTIONS), HEAD probes for cache validation /
+	//     existence checks. Sending these to the judge is a category
 	//     error: there's nothing to judge, and the LLM either denies
 	//     for lack of context or returns a non-deterministic verdict
-	//     that depends on noise in the prompt. Side-effect requests
-	//     (POST/PUT/DELETE/PATCH) always have bodies and reach the
-	//     judge; an attacker can't smuggle an action through a body-
-	//     less GET without a request body to put it in.
-	if pctx.Method == "GET" && len(pctx.Body) == 0 {
+	//     that depends on noise in the prompt.
+	//
+	//     Threat model: an attacker can't smuggle a payload through a
+	//     body-less GET/HEAD/OPTIONS — there's no request body to put
+	//     the action in. Side-effect HTTP methods (POST/PUT/DELETE/
+	//     PATCH) always reach the judge, body-having or not.
+	//
+	//     Caveat: servers that handle side-effect operations through
+	//     GET query strings (e.g. ?action=delete&id=42) violate REST
+	//     semantics and would bypass IBAC here — by design. Defending
+	//     against that needs to live in the server, not in IBAC; the
+	//     plugin trusts HTTP method semantics as a proxy for "is this
+	//     an action?", and a server that breaks that convention is
+	//     making its own authorization promises that IBAC can't see.
+	if isTransportRetrieval(pctx.Method) && len(pctx.Body) == 0 {
 		pctx.Skip("transport_stream")
 		return pipeline.Action{Type: pipeline.Continue}
 	}
@@ -491,6 +503,22 @@ func formatBodyExcerpt(body []byte, n int) string {
 // JSON-RPC notifications (any method starting with `notifications/`)
 // are also bypassed: they're one-way protocol signals, never tied to
 // a specific user turn.
+// isTransportRetrieval reports whether an HTTP method is one of the
+// retrieval-shaped methods that, combined with an empty body, signal
+// "transport-layer call, not a user-meaningful action." See step 5b
+// in OnRequest for the full threat-model rationale.
+//
+// HEAD shares GET's semantics by RFC 9110 §9.3.2 (servers MUST answer
+// HEAD identically to GET, sans body); OPTIONS is CORS preflight or
+// capability discovery, never an action.
+func isTransportRetrieval(method string) bool {
+	switch method {
+	case "GET", "HEAD", "OPTIONS":
+		return true
+	}
+	return false
+}
+
 func isMCPHousekeeping(method string) bool {
 	switch method {
 	case "initialize",
