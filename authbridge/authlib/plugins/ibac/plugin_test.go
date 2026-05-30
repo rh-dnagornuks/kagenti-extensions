@@ -32,12 +32,28 @@ func (f *fakeJudge) Evaluate(_ context.Context, intent, action string) (string, 
 }
 
 // newConfiguredIBAC returns an IBAC plugin pre-wired with a fake judge,
-// minimal config, and a sensible bypass list. Callers that want to
-// override behavior can mutate p.cfg / p.judge after the fact.
+// minimal config, and a sensible bypass list. Uses the default
+// no_intent_policy ("allow"). Callers that want to override behavior
+// can mutate p.cfg / p.judge after the fact, or use
+// newConfiguredIBACDeny for the strict-deny variant.
 func newConfiguredIBAC(t *testing.T, fj *fakeJudge) *IBAC {
 	t.Helper()
 	p := NewIBAC()
 	cfg := []byte(`{"judge_endpoint":"http://judge.invalid","judge_model":"test","timeout_ms":1000}`)
+	if err := p.Configure(json.RawMessage(cfg)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	p.judge = fj
+	return p
+}
+
+// newConfiguredIBACDeny returns an IBAC configured with
+// no_intent_policy: "deny" — used by tests that exercise the strict
+// fail-closed behavior on no_session / no_intent.
+func newConfiguredIBACDeny(t *testing.T, fj *fakeJudge) *IBAC {
+	t.Helper()
+	p := NewIBAC()
+	cfg := []byte(`{"judge_endpoint":"http://judge.invalid","judge_model":"test","timeout_ms":1000,"no_intent_policy":"deny"}`)
 	if err := p.Configure(json.RawMessage(cfg)); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
@@ -55,8 +71,11 @@ func invokeOnRequest(p pipeline.Plugin, pctx *pipeline.Context) pipeline.Action 
 }
 
 // makePCtx builds a minimal outbound pctx with a Session containing a
-// single A2A user-intent message ("summarize my emails"). Callers that
-// want to override individual fields mutate the returned context.
+// single A2A user-intent message ("summarize my emails"). Defaults
+// model a typical side-effect request — POST with a non-empty body —
+// so the pctx reaches the judge unless the test opts into a transport-
+// shaped path (body-less GET, housekeeping method, etc). Tests
+// override fields by mutating the returned context.
 func makePCtx(t *testing.T) *pipeline.Context {
 	t.Helper()
 	view := &pipeline.SessionView{
@@ -76,11 +95,12 @@ func makePCtx(t *testing.T) *pipeline.Context {
 	}
 	return &pipeline.Context{
 		Direction: pipeline.Outbound,
-		Method:    "GET",
+		Method:    "POST",
 		Scheme:    "http",
 		Host:      "weather-tool.team1.svc",
 		Path:      "/api/weather",
 		Headers:   http.Header{},
+		Body:      []byte(`{"city":"sf"}`),
 		Session:   view,
 	}
 }
@@ -116,6 +136,37 @@ func TestConfigure_AppliesDefaults(t *testing.T) {
 	}
 	if len(p.cfg.BypassPaths) == 0 {
 		t.Errorf("expected non-empty default BypassPaths")
+	}
+	if p.cfg.NoIntentPolicy != NoIntentPolicyAllow {
+		t.Errorf("default NoIntentPolicy = %q, want %q (allow)",
+			p.cfg.NoIntentPolicy, NoIntentPolicyAllow)
+	}
+}
+
+func TestConfigure_NoIntentPolicy_RejectsUnknownValue(t *testing.T) {
+	p := NewIBAC()
+	cfg := `{"judge_endpoint":"http://j","judge_model":"m","no_intent_policy":"maybe"}`
+	err := p.Configure(json.RawMessage(cfg))
+	if err == nil {
+		t.Fatal("expected error for unknown no_intent_policy value")
+	}
+	if !strings.Contains(err.Error(), "no_intent_policy") {
+		t.Errorf("error should mention no_intent_policy; got %q", err.Error())
+	}
+}
+
+func TestConfigure_NoIntentPolicy_AcceptsExplicitValues(t *testing.T) {
+	for _, v := range []string{"allow", "deny"} {
+		t.Run(v, func(t *testing.T) {
+			p := NewIBAC()
+			cfg := fmt.Sprintf(`{"judge_endpoint":"http://j","judge_model":"m","no_intent_policy":%q}`, v)
+			if err := p.Configure(json.RawMessage(cfg)); err != nil {
+				t.Fatalf("Configure(%q): %v", v, err)
+			}
+			if p.cfg.NoIntentPolicy != v {
+				t.Errorf("NoIntentPolicy = %q, want %q", p.cfg.NoIntentPolicy, v)
+			}
+		})
 	}
 }
 
@@ -262,20 +313,19 @@ func TestOnRequest_InferenceJudgedWhenEnabled(t *testing.T) {
 	}
 }
 
-// no_intent fail-closed: if a2a-parser isn't in the inbound chain (or
-// no user message was sent yet), IBAC has no recorded intent. Deny —
-// the alternative would be to allow blind tool calls, which defeats
-// the purpose of the plugin.
-func TestOnRequest_NoIntent_FailsClosed(t *testing.T) {
+// no_intent under policy=deny: when the operator configures strict
+// fail-closed semantics, missing intent must reject with "no_intent".
+// Validates the legacy behavior is still reachable via explicit config.
+func TestOnRequest_NoIntent_PolicyDeny_FailsClosed(t *testing.T) {
 	fj := &fakeJudge{}
-	p := newConfiguredIBAC(t, fj)
+	p := newConfiguredIBACDeny(t, fj)
 
 	pctx := makePCtx(t)
 	pctx.Session = &pipeline.SessionView{ID: "empty"} // no events
 	action := invokeOnRequest(p, pctx)
 
 	if action.Type != pipeline.Reject {
-		t.Errorf("got %v, want Reject when LastIntent is nil", action.Type)
+		t.Errorf("got %v, want Reject when LastIntent is nil under policy=deny", action.Type)
 	}
 	if fj.calls != 0 {
 		t.Errorf("judge should not be called when there's no intent")
@@ -286,22 +336,49 @@ func TestOnRequest_NoIntent_FailsClosed(t *testing.T) {
 	}
 }
 
-// Nil Session must not panic. The forward-proxy listener leaves
-// pctx.Session nil whenever no inbound A2A request has seeded the
-// active session bucket yet — common at agent startup. Treat it as
-// a distinct fail-closed reason (no_session) so dashboards can tell
-// "no inbound has happened yet" apart from "session exists but
-// contains no intent" (no_intent).
-func TestOnRequest_NilSession_FailsClosed(t *testing.T) {
+// no_intent under policy=allow (default): missing intent means the
+// request is either a legitimate agent self-action or a non-user-
+// driven flow. IBAC should not be in the middle — Skip with reason
+// "no_user_context" and Continue.
+func TestOnRequest_NoIntent_PolicyAllow_Bypasses(t *testing.T) {
 	fj := &fakeJudge{}
-	p := newConfiguredIBAC(t, fj)
+	p := newConfiguredIBAC(t, fj) // default policy=allow
+
+	pctx := makePCtx(t)
+	pctx.Session = &pipeline.SessionView{ID: "empty"} // no events
+	action := invokeOnRequest(p, pctx)
+
+	if action.Type != pipeline.Continue {
+		t.Errorf("got %v, want Continue when no intent under policy=allow", action.Type)
+	}
+	if fj.calls != 0 {
+		t.Errorf("judge should not be called when there's no intent")
+	}
+	inv := lastInvocation(t, pctx)
+	if inv.Action != pipeline.ActionSkip {
+		t.Errorf("Invocation action = %v, want ActionSkip", inv.Action)
+	}
+	if inv.Reason != "no_user_context" {
+		t.Errorf("Invocation reason = %q, want 'no_user_context'", inv.Reason)
+	}
+	if inv.Details["sub_reason"] != "no_intent" {
+		t.Errorf("Invocation sub_reason = %q, want 'no_intent'", inv.Details["sub_reason"])
+	}
+}
+
+// Nil Session under policy=deny: forward-proxy at agent startup
+// (before any inbound A2A) leaves pctx.Session nil. With strict
+// fail-closed configured, that must reject with "no_session".
+func TestOnRequest_NilSession_PolicyDeny_FailsClosed(t *testing.T) {
+	fj := &fakeJudge{}
+	p := newConfiguredIBACDeny(t, fj)
 
 	pctx := makePCtx(t)
 	pctx.Session = nil // before any inbound A2A
 	action := invokeOnRequest(p, pctx)
 
 	if action.Type != pipeline.Reject {
-		t.Errorf("got %v, want Reject when Session is nil", action.Type)
+		t.Errorf("got %v, want Reject when Session is nil under policy=deny", action.Type)
 	}
 	if fj.calls != 0 {
 		t.Errorf("judge should not be called when there's no session")
@@ -309,6 +386,36 @@ func TestOnRequest_NilSession_FailsClosed(t *testing.T) {
 	inv := lastInvocation(t, pctx)
 	if inv.Reason != "no_session" {
 		t.Errorf("Invocation reason = %q, want 'no_session'", inv.Reason)
+	}
+}
+
+// Nil Session under policy=allow (default): the canonical "agent
+// self-action at startup" case. The agent (e.g. exgentic-a2a-tool-
+// calling) makes outbound calls during its bootstrap before any user
+// turn — IBAC must Skip and Continue, not deny.
+func TestOnRequest_NilSession_PolicyAllow_Bypasses(t *testing.T) {
+	fj := &fakeJudge{}
+	p := newConfiguredIBAC(t, fj) // default policy=allow
+
+	pctx := makePCtx(t)
+	pctx.Session = nil // before any inbound A2A
+	action := invokeOnRequest(p, pctx)
+
+	if action.Type != pipeline.Continue {
+		t.Errorf("got %v, want Continue when Session is nil under policy=allow", action.Type)
+	}
+	if fj.calls != 0 {
+		t.Errorf("judge should not be called when there's no session")
+	}
+	inv := lastInvocation(t, pctx)
+	if inv.Action != pipeline.ActionSkip {
+		t.Errorf("Invocation action = %v, want ActionSkip", inv.Action)
+	}
+	if inv.Reason != "no_user_context" {
+		t.Errorf("Invocation reason = %q, want 'no_user_context'", inv.Reason)
+	}
+	if inv.Details["sub_reason"] != "no_session" {
+		t.Errorf("Invocation sub_reason = %q, want 'no_session'", inv.Details["sub_reason"])
 	}
 }
 
@@ -370,6 +477,115 @@ func TestOnRequest_MCPToolsCallIsNotHousekeeping(t *testing.T) {
 
 	if fj.calls != 1 {
 		t.Errorf("judge calls = %d, want 1 (tools/call must be judged)", fj.calls)
+	}
+}
+
+// Body-less retrieval-shaped requests (MCP Streamable HTTP SSE channel,
+// agent-card fetches, OAuth metadata probes, CORS preflights, HEAD
+// probes) carry no action payload and must bypass the judge with reason
+// "transport_stream". Without this, the MCP client's SSE channel-open
+// keeps getting 403'd, the connection dies, and the agent loops on
+// reconnect. Covers GET, HEAD, OPTIONS — all share the body-less
+// retrieval semantics per RFC 9110.
+func TestOnRequest_TransportStreamBypass_BodylessRetrieval(t *testing.T) {
+	for _, method := range []string{"GET", "HEAD", "OPTIONS"} {
+		t.Run(method, func(t *testing.T) {
+			fj := &fakeJudge{}
+			p := newConfiguredIBAC(t, fj)
+
+			pctx := makePCtx(t)
+			pctx.Session = nil // bypass must fire before the session check
+			pctx.Method = method
+			pctx.Host = "exgentic-mcp-gsm8k-mcp:8000"
+			pctx.Path = "/mcp"
+			pctx.Body = nil
+			action := invokeOnRequest(p, pctx)
+
+			if action.Type != pipeline.Continue {
+				t.Errorf("got %v, want Continue for body-less %s", action.Type, method)
+			}
+			if fj.calls != 0 {
+				t.Errorf("judge calls = %d, want 0 (body-less %s must not reach judge)", fj.calls, method)
+			}
+			inv := lastInvocation(t, pctx)
+			if inv.Action != pipeline.ActionSkip {
+				t.Errorf("Invocation action = %v, want ActionSkip", inv.Action)
+			}
+			if inv.Reason != "transport_stream" {
+				t.Errorf("Invocation reason = %q, want 'transport_stream'", inv.Reason)
+			}
+		})
+	}
+}
+
+// Body-having retrieval-shaped requests (rare, but legal — e.g. some
+// search APIs accept GET with a JSON body) must still reach the judge:
+// the body is the action.
+func TestOnRequest_TransportStreamBypass_GETWithBodyIsJudged(t *testing.T) {
+	fj := &fakeJudge{verdict: "allow"}
+	p := newConfiguredIBAC(t, fj)
+
+	pctx := makePCtx(t)
+	pctx.Method = "GET"
+	pctx.Host = "search-api"
+	pctx.Path = "/q"
+	pctx.Body = []byte(`{"q":"acme financials"}`)
+	_ = invokeOnRequest(p, pctx)
+
+	if fj.calls != 1 {
+		t.Errorf("judge calls = %d, want 1 (GET with body is an action)", fj.calls)
+	}
+}
+
+// Body-less POST/PUT/DELETE/PATCH must NOT bypass — the absence of
+// body alone isn't enough; the method must signal "retrieval" too.
+// A body-less POST is unusual but legal (semantic "do action") and
+// IBAC should still judge it.
+func TestOnRequest_TransportStreamBypass_BodylessPOSTIsJudged(t *testing.T) {
+	for _, method := range []string{"POST", "PUT", "DELETE", "PATCH"} {
+		t.Run(method, func(t *testing.T) {
+			fj := &fakeJudge{verdict: "allow"}
+			p := newConfiguredIBAC(t, fj)
+
+			pctx := makePCtx(t)
+			pctx.Method = method
+			pctx.Host = "api.example.com"
+			pctx.Path = "/refresh"
+			pctx.Body = nil
+			_ = invokeOnRequest(p, pctx)
+
+			if fj.calls != 1 {
+				t.Errorf("judge calls = %d, want 1 for body-less %s", fj.calls, method)
+			}
+		})
+	}
+}
+
+// describeAction's first non-empty token must be the HTTP method, with
+// no leading whitespace. This locks in the listener-side pctx.Method
+// wiring contract: if any listener regresses to leaving Method empty,
+// describeAction renders " http://..." (note the leading space) and
+// the judge sees a malformed prompt while operators see a confusing
+// session-event display. The visible-symptom test catches that here
+// rather than relying on the listener-package tests alone.
+func TestOnRequest_DescribeActionHasNoLeadingWhitespace(t *testing.T) {
+	fj := &fakeJudge{verdict: "allow"}
+	p := newConfiguredIBAC(t, fj)
+
+	pctx := makePCtx(t) // POST + body, will be judged
+	_ = invokeOnRequest(p, pctx)
+
+	if fj.calls != 1 {
+		t.Fatalf("expected judge to be called once; got calls=%d", fj.calls)
+	}
+	if fj.gotAction == "" {
+		t.Fatal("describeAction was empty; cannot assert format")
+	}
+	if first := fj.gotAction[0]; first == ' ' || first == '\t' || first == '\n' {
+		t.Errorf("describeAction starts with whitespace (listener Method regression?); got %q", fj.gotAction)
+	}
+	if !strings.HasPrefix(fj.gotAction, "POST ") {
+		t.Errorf("describeAction should start with 'POST '; got %q", fj.gotAction)
 	}
 }
 
