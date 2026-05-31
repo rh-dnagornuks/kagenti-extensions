@@ -185,10 +185,12 @@ pipeline:
 | `agent_llm_host` | No | `""` | Convenience: host of the agent's own LLM endpoint. Added to the bypass-host list so reasoning traffic is skipped regardless of `judge_inference`. |
 | `bypass_hosts` | No | Built-in list | Host globs (`path.Match` syntax) skipped without judging. Defaults: `keycloak.*`, `keycloak`, `spire-server.*`, `spire-agent.*`, `otel-collector.*`, `jaeger.*`, `prometheus.*`. **Bare `*` and similarly-broad patterns are rejected at startup.** |
 | `bypass_paths` | No | Built-in list | URL path globs skipped without judging. Defaults: `/.well-known/*`, `/healthz`, `/readyz`, `/livez`. |
+| `no_intent_policy` | No | `"allow"` | Behavior when an action-classified request has no recorded user intent. `"allow"` skips with `no_user_context`; `"deny"` rejects with `403 ibac.no_intent` / `ibac.no_session`. See "Default security posture" in Limitations. |
+| `unclassified_policy` | No | `"passthrough"` | Behavior at the classification gate when no parser populated any extension. `"passthrough"` returns Continue silently (defense in depth); `"judge"` falls through to the judge for plain-HTTP outbound coverage. The IBAC demo uses `"judge"`. See "Default security posture" in Limitations. |
 
 ### Pipeline Composition
 
-IBAC declares `RequiresAny: ["mcp-parser", "a2a-parser", "inference-parser"]`
+IBAC declares `RequiresAny: ["mcp-parser", "inference-parser"]`
 in its `Capabilities()` — the pipeline validator boot-fails if none of
 those parsers is in the same outbound chain. Without a parser, IBAC has
 no classification to read and would silently no-op on every request, so
@@ -327,10 +329,48 @@ SentinelHeaderName: "X-IBAC-Judge"})` — see
 - **No retry / circuit breaker.** Plugin authors retrying transient
   judge failures, or breaking a circuit on a flapping judge, layer
   that on the calling site or in the LLM-judge service itself.
-- **Plain-HTTP exfiltration is the primary target.** MCP-shaped
-  exfiltration is judged too (and gets richer enrichment via
-  `mcp-parser`), but the original threat shape is raw HTTP from local
-  function-calling tools.
+
+### Default security posture
+
+IBAC ships with two fail-open defaults that operators may want to
+override depending on threat model. Both are config knobs on the
+`ibac` plugin block.
+
+- **`unclassified_policy: "passthrough"`** (default). Traffic that no
+  protocol parser claimed — plain-HTTP outbound from local function-
+  calling tools, agent-card discovery, OAuth metadata fetches, CORS
+  preflights — passes through silently. IBAC's defense-in-depth
+  posture: only judge traffic a parser identified as user-meaningful.
+  Set `"judge"` for deployments where any outbound request from the
+  agent matters; the IBAC demo uses this setting to keep its plain-
+  HTTP exfiltration scenario operational. Production deployments
+  using MCP/A2A/inference exclusively should leave this at the
+  default and rely on egress allowlists / NetworkPolicy for plain-
+  HTTP outbound control.
+
+- **`no_intent_policy: "allow"`** (default). Action-classified
+  traffic that arrives before an inbound A2A turn has seeded a user
+  intent — agent startup, machine-to-machine flows, headless cron-
+  driven agents — passes through with a `skip/no_user_context`
+  Invocation. Set `"deny"` for deployments where every action is
+  required to be user-driven; missing intent then fails closed with
+  `403 ibac.no_intent` and `403 ibac.no_session` respectively.
+
+Both defaults reflect IBAC's posture: judge what the parsers tell us
+is a real action against a real user intent; let everything else
+through and rely on complementary controls (egress policy,
+NetworkPolicy, JWT validation) for the cases IBAC isn't suited to.
+
+### Threat-coverage notes
+
+- **Plain-HTTP exfiltration** is covered when `unclassified_policy:
+  "judge"` is set (and is the primary scenario the IBAC demo
+  exercises). Under the default `passthrough`, plain-HTTP outbound
+  passes through silently.
+- **MCP-shaped exfiltration** (the agent's tool-calling LLM emits a
+  `tools/call` that doesn't align with user intent) is covered by
+  default — `mcp-parser` populates `MCPExtension{IsAction:true}` and
+  the request flows to the judge regardless of `unclassified_policy`.
 
 ## Failure Modes (Detailed)
 

