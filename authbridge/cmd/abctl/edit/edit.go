@@ -7,6 +7,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/kagenti/kagenti-extensions/authbridge/cmd/abctl/apiclient"
 )
 
 // tempFileMaxAge is how long a stale edit tempfile is allowed to sit
@@ -54,7 +56,12 @@ type FetchedMsg struct {
 // $EDITOR), and emits FetchedMsg. The tempfile lives in $TMPDIR; abctl
 // leaves it in place on every exit path (success, error, abort) so users
 // can recover an in-progress edit.
-func FetchCmd(ctx context.Context, run Runner, namespace, pod string) tea.Cmd {
+//
+// catalog is the plugin catalog used to render the templates reference
+// section below the pipeline subtree. Pass nil to skip templates (older
+// servers without /v1/plugins, --endpoint mode without a catalog fetch,
+// or tests). The save path strips the templates section automatically.
+func FetchCmd(ctx context.Context, run Runner, namespace, pod string, catalog []apiclient.PluginCatalogEntry) tea.Cmd {
 	return func() tea.Msg {
 		agent, err := ResolveAgentName(ctx, run, namespace, pod)
 		if err != nil {
@@ -72,6 +79,12 @@ func FetchCmd(ctx context.Context, run Runner, namespace, pod string) tea.Cmd {
 		if _, err := tmp.Write(subtree); err != nil {
 			tmp.Close()
 			return FetchedMsg{Err: err}
+		}
+		if templates := RenderTemplates(catalog); len(templates) > 0 {
+			if _, err := tmp.Write(templates); err != nil {
+				tmp.Close()
+				return FetchedMsg{Err: err}
+			}
 		}
 		path := tmp.Name()
 		if err := tmp.Close(); err != nil {
