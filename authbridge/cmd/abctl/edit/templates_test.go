@@ -137,6 +137,75 @@ func TestFetchCmd_AppendsTemplatesWhenCatalogProvided(t *testing.T) {
 	}
 }
 
+func TestStripTemplates_RemovesFenceAndBelow(t *testing.T) {
+	original := "pipeline:\n  inbound:\n    plugins: []\n"
+	edited := []byte(original + "\n" + FenceMarker + "\n# --- ibac ---\n# stuff\n")
+	got := string(StripTemplates(edited))
+	if got != original+"\n" {
+		t.Fatalf("StripTemplates mismatch\nwant: %q\ngot:  %q", original+"\n", got)
+	}
+}
+
+func TestStripTemplates_NoFenceReturnsUnchanged(t *testing.T) {
+	in := []byte("pipeline:\n  inbound:\n    plugins: []\n")
+	got := StripTemplates(in)
+	if string(got) != string(in) {
+		t.Fatalf("input without fence should be unchanged\nwant: %q\ngot:  %q", string(in), string(got))
+	}
+}
+
+func TestStripTemplates_ToleratesLeadingWhitespace(t *testing.T) {
+	original := "pipeline: {}\n"
+	edited := []byte(original + "  " + FenceMarker + "\n# stuff\n")
+	got := string(StripTemplates(edited))
+	if got != original {
+		t.Fatalf("leading-whitespace fence not stripped\nwant: %q\ngot:  %q", original, got)
+	}
+}
+
+func TestStripTemplates_FenceAtEOF(t *testing.T) {
+	original := "pipeline: {}\n"
+	edited := []byte(original + FenceMarker)
+	got := string(StripTemplates(edited))
+	if got != original {
+		t.Fatalf("fence-at-eof case\nwant: %q\ngot:  %q", original, got)
+	}
+}
+
+func TestStripTemplates_NotFooledBySimilarLine(t *testing.T) {
+	// A YAML comment that mentions the marker as part of prose, not on its own line.
+	in := []byte("pipeline:\n  # see " + FenceMarker + " for details\n  inbound: {}\n")
+	got := StripTemplates(in)
+	if string(got) != string(in) {
+		t.Fatalf("inline mention should not match; input should be unchanged")
+	}
+}
+
+func TestStripTemplates_IntegratesWithRender(t *testing.T) {
+	// Round-trip: render templates after a real subtree, strip them.
+	// The renderer prefixes a blank-line separator before the fence
+	// for readability, so the strip preserves that separator. The
+	// subtree's structural content survives byte-for-byte; the trailing
+	// blank line is harmless (YAML parser tolerates it).
+	subtree := []byte("pipeline:\n  inbound:\n    plugins:\n      - name: ibac\n")
+	templates := RenderTemplates([]apiclient.PluginCatalogEntry{
+		{Name: "ibac", Description: "test"},
+	})
+	combined := append([]byte{}, subtree...)
+	combined = append(combined, templates...)
+	stripped := StripTemplates(combined)
+	if !strings.HasPrefix(string(stripped), string(subtree)) {
+		t.Fatalf("subtree not preserved at head of stripped output\nwant prefix: %q\ngot:         %q",
+			string(subtree), string(stripped))
+	}
+	// Whatever survives after the subtree should be whitespace only —
+	// no leaked fence content.
+	tail := strings.TrimSpace(string(stripped[len(subtree):]))
+	if tail != "" {
+		t.Fatalf("strip leaked non-whitespace tail: %q", tail)
+	}
+}
+
 func TestFetchCmd_NoTemplatesWhenCatalogNil(t *testing.T) {
 	r := func(_ context.Context, _ ...string) ([]byte, error) {
 		return []byte(fixtureCMYAML), nil

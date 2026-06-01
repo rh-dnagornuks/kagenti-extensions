@@ -650,6 +650,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.editState.err = "read edited file: " + err.Error()
 			return m, nil
 		}
+		// Strip the templates reference section before any downstream
+		// processing — the empty-check, YAML parse, splice preview, and
+		// validation all expect to see only the active pipeline subtree.
+		// No-op when the catalog wasn't included at fetch time (no fence
+		// marker present in the buffer).
+		edited = edit.StripTemplates(edited)
 		// Fix 2: reject empty input before it can silently wipe the pipeline.
 		if len(bytes.TrimSpace(edited)) == 0 {
 			m.editState.phase = editPhaseError

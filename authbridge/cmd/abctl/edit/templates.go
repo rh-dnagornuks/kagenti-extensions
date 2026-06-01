@@ -120,6 +120,46 @@ func renderField(b *strings.Builder, f apiclient.PluginFieldEntry) {
 	b.WriteString("\n")
 }
 
+// StripTemplates returns edited with the fence marker and everything
+// after it removed. If the fence marker is absent, edited is returned
+// unchanged — the safe-fallback contract from the plan: a missing
+// fence marker means the operator either deleted it deliberately or
+// the catalog wasn't available at fetch time, and either way the
+// remaining buffer is what gets applied.
+//
+// Detection is a strict line match: a line whose first non-whitespace
+// content is exactly FenceMarker. Whitespace before the marker is
+// tolerated (some editors auto-indent comment lines), but the marker
+// itself must be intact. Truncation occurs at the start of that line
+// so the trailing newline of the previous line — the active pipeline
+// subtree's terminator — survives.
+func StripTemplates(edited []byte) []byte {
+	target := FenceMarker
+	// Walk lines manually rather than splitting; preserves the byte
+	// position needed for the truncation cut.
+	i := 0
+	for i < len(edited) {
+		// Find the next line's end.
+		end := i
+		for end < len(edited) && edited[end] != '\n' {
+			end++
+		}
+		// Strip leading whitespace for the comparison.
+		start := i
+		for start < end && (edited[start] == ' ' || edited[start] == '\t') {
+			start++
+		}
+		if end-start >= len(target) && string(edited[start:start+len(target)]) == target {
+			// Truncate at i — the start of this line — discarding the
+			// fence and everything after.
+			return edited[:i]
+		}
+		// Advance past the newline.
+		i = end + 1
+	}
+	return edited
+}
+
 // placeholderFor picks the YAML placeholder that goes after the field
 // name. Documented defaults take priority for primitive types so the
 // operator sees the actual fallback inline; otherwise an empty value
