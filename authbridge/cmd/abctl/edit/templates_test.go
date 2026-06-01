@@ -244,8 +244,30 @@ func TestStripTemplates_RemovesFenceAndBelow(t *testing.T) {
 	original := "pipeline:\n  inbound:\n    plugins: []\n"
 	edited := []byte(original + "\n" + FenceMarker + "\n# --- ibac ---\n# stuff\n")
 	got := string(StripTemplates(edited))
-	if got != original+"\n" {
-		t.Fatalf("StripTemplates mismatch\nwant: %q\ngot:  %q", original+"\n", got)
+	// Trailing blank line(s) before the fence are also stripped — the
+	// renderer prepends them as visual padding, so preserving them
+	// would create drift on save-without-changes.
+	if got != original {
+		t.Fatalf("StripTemplates mismatch\nwant: %q\ngot:  %q", original, got)
+	}
+}
+
+func TestStripTemplates_TrimsMultipleBlankLinesBeforeFence(t *testing.T) {
+	original := "pipeline: {}\n"
+	edited := []byte(original + "\n\n\n" + FenceMarker + "\nbanner\n")
+	got := string(StripTemplates(edited))
+	if got != original {
+		t.Fatalf("multiple blank lines before fence should all be stripped\nwant: %q\ngot:  %q", original, got)
+	}
+}
+
+func TestStripTemplates_TrimsWhitespaceOnlyLineBeforeFence(t *testing.T) {
+	// A line with just spaces / tabs is also "blank" for trim purposes.
+	original := "pipeline: {}\n"
+	edited := []byte(original + "  \t  \n" + FenceMarker + "\n")
+	got := string(StripTemplates(edited))
+	if got != original {
+		t.Fatalf("whitespace-only line before fence should be stripped\nwant: %q\ngot:  %q", original, got)
 	}
 }
 

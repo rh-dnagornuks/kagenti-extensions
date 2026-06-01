@@ -1,6 +1,7 @@
 package edit
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 
@@ -16,11 +17,31 @@ import (
 const FenceMarker = "# === ABCTL TEMPLATES BELOW (stripped on save) ==="
 
 // templatesBanner is the prose shown immediately below FenceMarker,
-// telling the operator how to use the reference.
-const templatesBanner = `# Reference: every plugin in the catalog. Copy a block above the fence,
-# strip the leading "# " from each line, then adjust indentation to fit
-# your inbound: or outbound: chain (typically 6-space "- name:" indent).
-# This entire section is removed before kubectl apply.`
+// telling the operator how to use the reference. The leading and
+// trailing rule lines bracket the fence visually so the boundary
+// scans at-a-glance even after a long pipeline subtree.
+//
+// All lines are below the fence and get stripped on save. The visual
+// padding ABOVE the fence is supplied by RenderTemplates as blank
+// lines; StripTemplates trims trailing blank lines so the round-trip
+// stays byte-identical.
+//
+// ASCII-only by design: a previous Unicode-bordered banner triggered
+// editor-plugin failures on some operator setups. ASCII works
+// everywhere without sacrificing visual hierarchy.
+const templatesBanner = `# ====================================================================
+#
+# Reference: every plugin in the catalog.
+#
+# To use a template, copy a plugin block from below, paste it above the
+# fence into your inbound: or outbound: chain, strip the leading "# "
+# from each line, then adjust indentation (the templates use a 6-space
+# "- name:" indent -- match whatever your existing plugins use).
+#
+# This entire section -- from the fence line down -- is stripped before
+# the edited buffer is written back to the ConfigMap.
+#
+# ====================================================================`
 
 // RenderTemplates returns a fence marker followed by a commented YAML
 // template block per plugin in the catalog. Returns nil for an empty
@@ -31,17 +52,20 @@ const templatesBanner = `# Reference: every plugin in the catalog. Copy a block 
 // templates still parse as comment-only YAML (no semantic effect),
 // which is the safe-fallback the plan committed to.
 //
-// Output starts directly with the fence marker (no leading blank
-// separator). This matters at save time: the active pipeline subtree
-// already ends with its own newline, so a stripped buffer should equal
-// the original subtree byte-for-byte. A blank-line separator here
-// would survive the strip and surface as a spurious `+` line in the
-// no-changes diff.
+// Output starts with two blank lines for visual separation from the
+// active pipeline subtree above, then the fence marker, then the
+// banner block. The blank lines are safe because StripTemplates trims
+// trailing whitespace-only lines after truncating at the fence — so a
+// render-then-strip round-trip is byte-identical even with the
+// padding. A render that emitted CONTENT before the fence would
+// survive strip and surface as a spurious `+` line in the no-changes
+// diff, which is why all decoration lives below the fence.
 func RenderTemplates(plugins []apiclient.PluginCatalogEntry) []byte {
 	if len(plugins) == 0 {
 		return nil
 	}
 	var b strings.Builder
+	b.WriteString("\n\n")
 	b.WriteString(FenceMarker)
 	b.WriteString("\n")
 	b.WriteString(templatesBanner)
@@ -255,6 +279,12 @@ func renderField(b *strings.Builder, f apiclient.PluginFieldEntry, indent string
 // itself must be intact. Truncation occurs at the start of that line
 // so the trailing newline of the previous line — the active pipeline
 // subtree's terminator — survives.
+//
+// After truncating, any trailing whitespace-only lines are also
+// removed. RenderTemplates inserts blank lines BEFORE the fence as
+// visual padding; without this trim those blank lines would survive
+// strip and surface as spurious `+` diff lines on save-without-changes.
+// The previous real line's terminating \n is preserved.
 func StripTemplates(edited []byte) []byte {
 	target := FenceMarker
 	// Walk lines manually rather than splitting; preserves the byte
@@ -273,13 +303,43 @@ func StripTemplates(edited []byte) []byte {
 		}
 		if end-start >= len(target) && string(edited[start:start+len(target)]) == target {
 			// Truncate at i — the start of this line — discarding the
-			// fence and everything after.
-			return edited[:i]
+			// fence and everything after, then trim trailing blank
+			// lines so the renderer can prepend visual padding.
+			return trimTrailingBlankLines(edited[:i])
 		}
 		// Advance past the newline.
 		i = end + 1
 	}
 	return edited
+}
+
+// trimTrailingBlankLines drops trailing whitespace-only lines from
+// out, preserving the terminating newline of the last non-blank line.
+// "out" is expected to end with \n (the typical content shape) but
+// the function is safe on any input.
+func trimTrailingBlankLines(out []byte) []byte {
+	for len(out) > 0 && out[len(out)-1] == '\n' {
+		// Find the start of the line that ends at len(out)-1.
+		prevNL := bytes.LastIndexByte(out[:len(out)-1], '\n')
+		lineStart := prevNL + 1 // 0 when no earlier \n
+		line := out[lineStart : len(out)-1]
+		if !isBlankLine(line) {
+			break
+		}
+		// Drop the blank line; the previous real line's terminating
+		// \n (at position prevNL) is at out[lineStart-1] and stays.
+		out = out[:lineStart]
+	}
+	return out
+}
+
+func isBlankLine(b []byte) bool {
+	for _, c := range b {
+		if c != ' ' && c != '\t' {
+			return false
+		}
+	}
+	return true
 }
 
 // placeholderFor picks the YAML placeholder that goes after the field
