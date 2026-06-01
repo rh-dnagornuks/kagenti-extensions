@@ -30,12 +30,18 @@ const templatesBanner = `# Reference: every plugin in the catalog. Copy a block 
 // comments. If the operator deletes the fence marker by accident, the
 // templates still parse as comment-only YAML (no semantic effect),
 // which is the safe-fallback the plan committed to.
+//
+// Output starts directly with the fence marker (no leading blank
+// separator). This matters at save time: the active pipeline subtree
+// already ends with its own newline, so a stripped buffer should equal
+// the original subtree byte-for-byte. A blank-line separator here
+// would survive the strip and surface as a spurious `+` line in the
+// no-changes diff.
 func RenderTemplates(plugins []apiclient.PluginCatalogEntry) []byte {
 	if len(plugins) == 0 {
 		return nil
 	}
 	var b strings.Builder
-	b.WriteString("\n")
 	b.WriteString(FenceMarker)
 	b.WriteString("\n")
 	b.WriteString(templatesBanner)

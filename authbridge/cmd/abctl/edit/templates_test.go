@@ -184,11 +184,11 @@ func TestStripTemplates_NotFooledBySimilarLine(t *testing.T) {
 }
 
 func TestStripTemplates_IntegratesWithRender(t *testing.T) {
-	// Round-trip: render templates after a real subtree, strip them.
-	// The renderer prefixes a blank-line separator before the fence
-	// for readability, so the strip preserves that separator. The
-	// subtree's structural content survives byte-for-byte; the trailing
-	// blank line is harmless (YAML parser tolerates it).
+	// Round-trip: render templates after a real subtree, strip them,
+	// and get the subtree back byte-for-byte. This is the no-changes-
+	// diff case: opening + saving without edits must produce the same
+	// bytes the operator started with — otherwise the diff prompt
+	// misleadingly shows a `+` line and asks to apply.
 	subtree := []byte("pipeline:\n  inbound:\n    plugins:\n      - name: ibac\n")
 	templates := RenderTemplates([]apiclient.PluginCatalogEntry{
 		{Name: "ibac", Description: "test"},
@@ -196,15 +196,9 @@ func TestStripTemplates_IntegratesWithRender(t *testing.T) {
 	combined := append([]byte{}, subtree...)
 	combined = append(combined, templates...)
 	stripped := StripTemplates(combined)
-	if !strings.HasPrefix(string(stripped), string(subtree)) {
-		t.Fatalf("subtree not preserved at head of stripped output\nwant prefix: %q\ngot:         %q",
+	if string(stripped) != string(subtree) {
+		t.Fatalf("round-trip mismatch (would surface as spurious diff)\nwant: %q\ngot:  %q",
 			string(subtree), string(stripped))
-	}
-	// Whatever survives after the subtree should be whitespace only —
-	// no leaked fence content.
-	tail := strings.TrimSpace(string(stripped[len(subtree):]))
-	if tail != "" {
-		t.Fatalf("strip leaked non-whitespace tail: %q", tail)
 	}
 }
 
