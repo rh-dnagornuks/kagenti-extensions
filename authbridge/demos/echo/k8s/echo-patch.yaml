@@ -8,7 +8,9 @@ inbound_plugin_config:
 outbound_plugin_config:
   token-exchange:
     resolve_placeholders: true
+# Host must match what the agent dials (router compiles the glob with '.' as a
+# separator, so '*' does not cross dots — use the full in-cluster FQDN).
 routes:
-  - host: "echo-upstream"
+  - host: "echo-upstream.team1.svc.cluster.local"
     target_audience: "echo-upstream"
     token_scopes: "openid echo-upstream-aud"
