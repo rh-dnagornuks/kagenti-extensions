@@ -261,7 +261,7 @@ func (p *OPA) decisionPath(pctx *pipeline.Context, phase string) string {
 
 func (p *OPA) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.Action {
 	dec := p.decider.Load()
-	if dec == nil {
+	if dec == nil || !p.ready.Load() {
 		pctx.Record(pipeline.Invocation{
 			Action: pipeline.ActionDeny,
 			Reason: "opa_not_ready",
@@ -309,9 +309,12 @@ func (p *OPA) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.Ac
 
 func (p *OPA) OnResponse(ctx context.Context, pctx *pipeline.Context) pipeline.Action {
 	dec := p.decider.Load()
-	if dec == nil {
-		pctx.Skip("opa_not_ready")
-		return pipeline.Action{Type: pipeline.Continue}
+	if dec == nil || !p.ready.Load() {
+		pctx.Record(pipeline.Invocation{
+			Action: pipeline.ActionDeny,
+			Reason: "opa_not_ready",
+		})
+		return pipeline.DenyStatus(503, "upstream.unreachable", "opa policy engine not initialized")
 	}
 
 	path := p.decisionPath(pctx, "response")
@@ -514,13 +517,24 @@ func buildInferenceInput(ext *pipeline.InferenceExtension, inc includeSet) map[s
 	return inf
 }
 
+var redactedHeaders = map[string]bool{
+	"authorization":       true,
+	"proxy-authorization": true,
+	"cookie":              true,
+	"set-cookie":          true,
+}
+
 func flattenHeaders(h http.Header) map[string]string {
 	if h == nil {
 		return nil
 	}
 	flat := make(map[string]string, len(h))
 	for k, vals := range h {
-		flat[strings.ToLower(k)] = strings.Join(vals, ",")
+		lower := strings.ToLower(k)
+		if redactedHeaders[lower] {
+			continue
+		}
+		flat[lower] = strings.Join(vals, ",")
 	}
 	return flat
 }

@@ -903,6 +903,7 @@ func TestOnRequest_Allow(t *testing.T) {
 		inc: newIncludeSet(nil),
 	}
 	p.decider.Store(&dec)
+	p.ready.Store(true)
 	pctx := &pipeline.Context{
 		Direction: pipeline.Inbound,
 		Method:    "GET",
@@ -924,6 +925,7 @@ func TestOnRequest_Deny(t *testing.T) {
 		inc: newIncludeSet(nil),
 	}
 	p.decider.Store(&dec)
+	p.ready.Store(true)
 	pctx := &pipeline.Context{
 		Direction: pipeline.Inbound,
 		Method:    "GET",
@@ -948,6 +950,7 @@ func TestOnRequest_DecisionError(t *testing.T) {
 		inc: newIncludeSet(nil),
 	}
 	p.decider.Store(&dec)
+	p.ready.Store(true)
 	pctx := &pipeline.Context{
 		Direction: pipeline.Inbound,
 		Method:    "GET",
@@ -969,6 +972,7 @@ func TestOnRequest_UndefinedSkips(t *testing.T) {
 		inc: newIncludeSet(nil),
 	}
 	p.decider.Store(&dec)
+	p.ready.Store(true)
 	pctx := &pipeline.Context{
 		Direction: pipeline.Inbound,
 		Method:    "GET",
@@ -994,6 +998,7 @@ func TestOnRequest_OutboundUsesCorrectPath(t *testing.T) {
 		inc: newIncludeSet(nil),
 	}
 	p.decider.Store(&dec)
+	p.ready.Store(true)
 	pctx := &pipeline.Context{
 		Direction: pipeline.Outbound,
 		Method:    "GET",
@@ -1019,6 +1024,7 @@ func TestOnRequest_InboundUsesCorrectPath(t *testing.T) {
 		inc: newIncludeSet(nil),
 	}
 	p.decider.Store(&dec)
+	p.ready.Store(true)
 	pctx := &pipeline.Context{
 		Direction: pipeline.Inbound,
 		Method:    "POST",
@@ -1048,8 +1054,11 @@ func TestOnResponse_NotReady(t *testing.T) {
 	pctx.SetCurrentPlugin("opa", "response")
 	defer pctx.ClearCurrentPlugin()
 	action := p.OnResponse(context.Background(), pctx)
-	if action.Type != pipeline.Continue {
-		t.Fatal("expected continue (skip) when decider is nil on response path")
+	if action.Type != pipeline.Reject {
+		t.Fatal("expected reject when decider is nil on response path")
+	}
+	if action.Violation.Status != 503 {
+		t.Errorf("expected 503, got %d", action.Violation.Status)
 	}
 }
 
@@ -1059,6 +1068,7 @@ func TestOnResponse_Allow(t *testing.T) {
 		inc: newIncludeSet(nil),
 	}
 	p.decider.Store(&dec)
+	p.ready.Store(true)
 	pctx := &pipeline.Context{
 		Direction:       pipeline.Inbound,
 		Method:          "GET",
@@ -1082,6 +1092,7 @@ func TestOnResponse_Deny(t *testing.T) {
 		inc: newIncludeSet(nil),
 	}
 	p.decider.Store(&dec)
+	p.ready.Store(true)
 	pctx := &pipeline.Context{
 		Direction:  pipeline.Inbound,
 		Method:     "GET",
@@ -1104,6 +1115,7 @@ func TestOnResponse_UndefinedSkips(t *testing.T) {
 		inc: newIncludeSet(nil),
 	}
 	p.decider.Store(&dec)
+	p.ready.Store(true)
 	pctx := &pipeline.Context{
 		Direction:  pipeline.Outbound,
 		Method:     "GET",
@@ -1130,6 +1142,7 @@ func TestOnResponse_OutboundUsesCorrectPath(t *testing.T) {
 		inc: newIncludeSet(nil),
 	}
 	p.decider.Store(&dec)
+	p.ready.Store(true)
 	pctx := &pipeline.Context{
 		Direction:  pipeline.Outbound,
 		Method:     "GET",

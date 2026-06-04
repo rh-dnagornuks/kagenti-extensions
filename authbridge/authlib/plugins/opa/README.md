@@ -29,7 +29,7 @@ The plugin uses four fixed OPA decision paths, one for each evaluation point:
 | Path | Phase | Purpose |
 |------|-------|---------|
 | `authbridge/inbound/request` | Inbound request | Primary authorization — validate caller identity, enforce access control |
-| `authbridge/inbound/response` | Inbound response | Fine-grained response evaluation (rare, expensive) — inspect response body/headers |
+| `authbridge/inbound/response` | Inbound response | Fine-grained response evaluation (rare) — inspect response status, headers, and parsed protocol content via `include` |
 | `authbridge/outbound/request` | Outbound request | Control outgoing requests to external systems — ensure delegated tokens are used in line with task intent |
 | `authbridge/outbound/response` | Outbound response | Protect the agent from data attacks in responses (rare) |
 
@@ -98,11 +98,19 @@ the full conversation history:
       - "inference.tools.detail" # tool descriptions and JSON schemas
 ```
 
+### Bundle server transport
+
+The current implementation fetches bundles over plaintext HTTP with no client
+authentication. This is suitable for deployments where the bundle server is
+co-located in the same Kubernetes cluster and in-cluster HTTP is considered
+sufficient. A future enhancement will add mTLS support with SPIFFE certificate.
+Additionally a future enhancement will add TLS with service account token.
+
 ### Config fields
 
 | Field | Required | Default | Description |
 |---|---|---|---|
-| `bundle_url` | yes | | Base URL of the Kagenti Bundle Server |
+| `bundle_url` | yes | | Base URL of the Kagenti Bundle Server (HTTP, in-cluster) |
 | `agent_id_file` | no | `/shared/client-id.txt` | Path to the file containing the agent's client ID |
 | `agent_id` | no | | Inline agent ID; when set, `agent_id_file` is ignored |
 | `polling_min_delay` | no | `10` | Minimum bundle polling interval in seconds |
@@ -147,8 +155,8 @@ with an empty `include` list.
   "path": "/api/v1/invoke",
   "host": "my-agent",
   "headers": {
-    "authorization": "Bearer eyJ...",
-    "content-type": "application/json"
+    "content-type": "application/json",
+    "x-request-id": "abc-123"
   },
   "identity": {
     "subject": "user-123",
@@ -237,7 +245,7 @@ On the response path the document also includes:
 | `method` | always | HTTP method (`GET`, `POST`, ...) |
 | `path` | always | Request URL path |
 | `host` | always | HTTP `Host` header value |
-| `headers` | always | Flattened request headers (lowercase keys, multi-values joined with `,`) |
+| `headers` | always | Flattened request headers (lowercase keys, multi-values joined with `,`). Credential headers (`authorization`, `proxy-authorization`, `cookie`, `set-cookie`) are redacted — use `input.identity` for auth decisions. |
 | `identity` | when jwt-validation ran | Subject, client ID, and scopes from the validated JWT |
 | `agent` | when agent identity is set | The agent's own client ID |
 | `a2a` | when a2a-parser ran | A2A protocol metadata (method, session_id, task_id, role) |
@@ -448,9 +456,9 @@ fields will be missing and the policy must handle that case.
 ## Deny behavior
 
 - **Request path**: OPA not initialized or decision error -> 503. Policy deny -> 403. Path undefined -> skip.
-- **Response path**: OPA not initialized -> skip. Policy deny -> 403. Path undefined -> skip.
+- **Response path**: OPA not initialized -> 503. Policy deny -> 403. Path undefined -> skip.
 - **Before bundle loads**: the readiness probe holds traffic off the pod. If a
-  request arrives anyway (e.g. in tests), the plugin denies with 503.
+  request or response arrives anyway (e.g. in tests), the plugin denies with 503.
 
 ## Session events
 
@@ -461,7 +469,7 @@ The plugin records `Invocation` entries for every decision:
 | `allow` | `policy_allowed` / `response_policy_allowed` | OPA returned allow |
 | `deny` | `policy_denied` / `response_policy_denied` | OPA returned deny |
 | `deny` | `decision_error` / `response_decision_error` | OPA evaluation failed |
-| `skip` | `opa_not_ready` | Response path, OPA not yet initialized |
+| `deny` | `opa_not_ready` | OPA not yet initialized (bundle not loaded) |
 | `skip` | `no_policy_rule` | Decision path undefined in bundle (no rule for this phase) |
 
 These appear in the session events API (`:9094`) and in `abctl`.
