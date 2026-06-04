@@ -97,18 +97,17 @@ func (p *InferenceParser) OnRequest(_ context.Context, pctx *pipeline.Context) p
 	return pipeline.Action{Type: pipeline.Continue}
 }
 
-// OnResponse populates the response-side fields (Completion, FinishReason,
-// token counts) on pctx.Extensions.Inference for buffered responses.
-// Streaming-aware listeners take the OnResponseFrame path instead and
-// this method is a no-op when the streaming path has already
-// finalized state. Aggregation across frames lives in OnResponseFrame
-// + the inferenceStreamState scratch on the extension.
+// OnResponse is the legacy buffered-path response hook. Because this
+// plugin implements StreamingResponder, pipeline.RunResponse skips it
+// and OnResponseFrame is the dispatch path under all listeners — this
+// method is unreachable from a normal listener. Kept for tests and
+// hypothetical pipelines that call OnResponse directly without going
+// through RunResponse, with a defensive guard against re-recording if
+// the streaming path has already populated state.
 func (p *InferenceParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeline.Action {
 	if pctx.Extensions.Inference == nil {
 		return pipeline.Action{Type: pipeline.Continue}
 	}
-	// If the streaming path already finalized (Completion populated or
-	// FinishReason set), don't re-record on the buffered path.
 	ext := pctx.Extensions.Inference
 	if ext.Completion != "" || ext.FinishReason != "" || ext.TotalTokens > 0 {
 		return pipeline.Action{Type: pipeline.Continue}

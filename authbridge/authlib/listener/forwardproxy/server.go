@@ -12,6 +12,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/auth"
@@ -24,20 +26,6 @@ import (
 )
 
 const maxBodySize = 1 << 20 // 1MB — matches Envoy's default per_stream_buffer_limit_bytes
-
-// responseHeaderTimeout bounds the time-to-first-byte (headers) for an
-// upstream response. Replaces the old http.Client.Timeout, which
-// covered the entire request lifecycle including the body read and so
-// killed slow streaming responses (text/event-stream MCP tools/call,
-// A2A message/stream, OpenAI streaming chat completions). With the
-// timeout moved to the transport's ResponseHeaderTimeout, slow tools
-// can stream as long as they like — only a wedged upstream that fails
-// to send any headers within this window aborts.
-//
-// 30s preserves the prior behavior's time-to-headers ceiling. Tools
-// that took longer to *return headers* never worked under the old
-// configuration either.
-const responseHeaderTimeout = 30 * time.Second
 
 // streamReadIdleTimeout caps how long the proxy waits for the next
 // byte off a streaming response body. The time.Duration is applied
@@ -96,10 +84,15 @@ func NewServer(outbound *pipeline.Holder, sessions *session.Store, mtls *MTLSOpt
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		// Time-to-headers ceiling for the upstream response. Replaces
-		// the old http.Client.Timeout (which covered the body read
-		// and broke streaming). See responseHeaderTimeout.
-		ResponseHeaderTimeout: responseHeaderTimeout,
+		// No ResponseHeaderTimeout: Streamable HTTP / MCP servers may
+		// hold response headers open until a slow tool completes, even
+		// when the eventual response is application/json (the server
+		// picks JSON vs SSE per call). A fixed time-to-headers ceiling
+		// reproduces the original 502 — the pre-headers wait is part
+		// of the same long tool execution we're trying to permit. The
+		// inbound request context + the per-Read idle timer on
+		// streaming bodies are the bounds; an unrecoverably wedged
+		// upstream is closed when the client cancels the request.
 	}
 
 	if mtls != nil {
@@ -433,11 +426,10 @@ func isEventStream(contentType string) bool {
 		return false
 	}
 	// Strip parameters: "text/event-stream; charset=utf-8" → "text/event-stream".
-	if idx := indexByteASCIICaseInsensitive(contentType, ';'); idx >= 0 {
+	if idx := strings.IndexByte(contentType, ';'); idx >= 0 {
 		contentType = contentType[:idx]
 	}
-	contentType = trimASCIISpace(contentType)
-	return equalASCIIFold(contentType, "text/event-stream")
+	return strings.EqualFold(strings.TrimSpace(contentType), "text/event-stream")
 }
 
 // handleStreamingResponse forwards a text/event-stream response to the
@@ -463,6 +455,23 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, r *http.Request,
 		s.streamFallbackBuffered(w, r, resp, pctx)
 		return
 	}
+
+	// Defer the final last=true dispatch + session-event recording so
+	// every exit path (normal EOF, upstream read error, downstream
+	// client-write error) finalizes aggregating plugins and records
+	// the response event. Without this, a client disconnect mid-stream
+	// leaves inference/a2a stuck in an unfinalized state and emits no
+	// SessionResponse row to abctl.
+	defer func() {
+		finalAction := s.OutboundPipeline.RunResponseFrame(r.Context(), pctx, nil, true)
+		if finalAction.Type == pipeline.Reject {
+			// Headers already sent; we can't promote to 502, but
+			// surface the policy violation so operators see it.
+			slog.Warn("forward-proxy: streaming response rejected on finalization (headers already sent)",
+				"host", r.Host, "violation", finalAction.Violation)
+		}
+		s.recordOutboundResponseEvent(pctx, resp.StatusCode)
+	}()
 
 	// Forward headers and the streaming status code BEFORE the first
 	// frame is written. Strip Content-Length since we'll be writing
@@ -506,40 +515,31 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, r *http.Request,
 			break
 		}
 
-		// Write the frame back as a single SSE event. Reconstructing
-		// "data: ...\n\n" preserves the SSE wire shape regardless of
-		// whether the upstream used "data: " or "data:" or split across
-		// multiple data lines. Multi-line data is folded onto one line
-		// here, which is fine for JSON-RPC payloads (no embedded LF).
-		if _, err := w.Write([]byte("data: ")); err != nil {
-			slog.Debug("forward-proxy: streaming write error", "host", r.Host, "error", err)
-			return
-		}
-		if _, err := w.Write(frame); err != nil {
-			slog.Debug("forward-proxy: streaming write error", "host", r.Host, "error", err)
-			return
-		}
-		if _, err := w.Write([]byte("\n\n")); err != nil {
-			slog.Debug("forward-proxy: streaming write error", "host", r.Host, "error", err)
-			return
+		// Write the frame back as one or more SSE data lines. The
+		// sseframe reader folds multi-line `data:` events with `\n`
+		// separators per the spec; re-split here so each original line
+		// gets its own `data: ` prefix and the downstream parser sees
+		// the same event boundaries the upstream produced. For the
+		// single-line JSON-RPC payloads this targets, this loop is
+		// equivalent to writing `data: <frame>\n\n` once.
+		if !writeSSEFrame(w, frame) {
+			slog.Debug("forward-proxy: streaming write error", "host", r.Host)
+			break
 		}
 		flusher.Flush()
 		bytesWritten += len(frame)
 	}
-
-	// Final last=true call so aggregating plugins (inference-parser,
-	// a2a-parser) finalize. Always called exactly once even on a zero-
-	// frame stream (per StreamingResponder contract).
-	s.OutboundPipeline.RunResponseFrame(r.Context(), pctx, nil, true)
-
-	s.recordOutboundResponseEvent(pctx, resp.StatusCode)
 }
 
 // streamFallbackBuffered handles the rare case of a streaming
 // Content-Type response on a ResponseWriter that doesn't support
-// http.Flusher — falls back to the original buffered path. The
-// duplicated logic is small enough to keep here rather than refactor
-// the main handler around the Flusher fork.
+// http.Flusher — buffer the whole SSE body, then re-parse it through
+// sseframe so streaming-aware plugins receive one OnResponseFrame call
+// per SSE event followed by last=true. Without per-frame dispatch the
+// inference parser (and any future fold-and-finalize plugin) would try
+// to JSON-decode the whole SSE blob as one chunk, fail, and clobber a
+// correctly-parsed completion. Production ResponseWriters implement
+// http.Flusher so this path is mostly hit in tests.
 func (s *Server) streamFallbackBuffered(w http.ResponseWriter, r *http.Request, resp *http.Response, pctx *pipeline.Context) {
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize+1))
 	if err != nil {
@@ -561,7 +561,30 @@ func (s *Server) streamFallbackBuffered(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	if s.OutboundPipeline.HasStreamingResponders() {
-		_ = s.OutboundPipeline.RunResponseFrame(r.Context(), pctx, respBody, true)
+		// Re-parse the buffered SSE body frame-by-frame so plugins see the
+		// same per-event shape as the real streaming path. A Reject is
+		// honored here — headers are not yet on the wire.
+		reader := sseframe.NewReader(bytes.NewReader(respBody), maxBodySize)
+		for {
+			frame, ferr := reader.ReadFrame()
+			if ferr == io.EOF {
+				break
+			}
+			if ferr != nil {
+				slog.Warn("forward-proxy: streaming response read error in fallback", "host", r.Host, "error", ferr)
+				break
+			}
+			frameAction := s.OutboundPipeline.RunResponseFrame(r.Context(), pctx, frame, false)
+			if frameAction.Type == pipeline.Reject {
+				httpx.WriteRejection(w, frameAction)
+				return
+			}
+		}
+		finalAction := s.OutboundPipeline.RunResponseFrame(r.Context(), pctx, nil, true)
+		if finalAction.Type == pipeline.Reject {
+			httpx.WriteRejection(w, finalAction)
+			return
+		}
 	}
 	s.recordOutboundResponseEvent(pctx, resp.StatusCode)
 	for key, values := range resp.Header {
@@ -752,6 +775,41 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	_ = upstream.Close()
 }
 
+// writeSSEFrame writes one SSE event built from a sseframe-decoded
+// frame back to w. The decoder folds multi-line `data:` events with
+// `\n` separators; this helper splits on those `\n`s and emits one
+// `data: <line>\n` per original line followed by the blank-line
+// terminator, so a downstream SSE parser sees the same event
+// boundaries the upstream produced. Returns true when every byte
+// was written; false on any write error so the caller can stop
+// forwarding without re-checking each Write.
+func writeSSEFrame(w io.Writer, frame []byte) bool {
+	for len(frame) > 0 {
+		nl := bytes.IndexByte(frame, '\n')
+		var line []byte
+		if nl < 0 {
+			line = frame
+			frame = nil
+		} else {
+			line = frame[:nl]
+			frame = frame[nl+1:]
+		}
+		if _, err := w.Write([]byte("data: ")); err != nil {
+			return false
+		}
+		if _, err := w.Write(line); err != nil {
+			return false
+		}
+		if _, err := w.Write([]byte("\n")); err != nil {
+			return false
+		}
+	}
+	if _, err := w.Write([]byte("\n")); err != nil {
+		return false
+	}
+	return true
+}
+
 // idleReader wraps r so each Read enforces an idle deadline. The
 // goroutine pattern (timer reset on every Read entry, cancelled on
 // every Read exit) is portable across any io.ReadCloser, unlike
@@ -766,9 +824,21 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 // a long-running tool that emits one byte every minute (within the
 // idle window) keeps the stream alive. The streamReadIdleTimeout
 // constant captures the wall-clock budget.
+//
+// Race-with-success note: time.AfterFunc + timer.Stop() does NOT
+// wait for an already-fired callback. If the timer fires just as a
+// Read returns successfully, the close runs after the success and
+// would leave the next Read failing under a healthy upstream. The
+// closeOnce field makes the close idempotent and Close() also runs
+// it, so a stray late timer is harmless: the underlying body is
+// closed at most once, and a successful in-flight Read keeps its
+// data either way. The wider hazard — closing the body concurrently
+// with an active Read — is the documented unblock mechanism the
+// stdlib http transport relies on for forced disconnects.
 type idleReadCloser struct {
-	rc      io.ReadCloser
-	timeout time.Duration
+	rc        io.ReadCloser
+	timeout   time.Duration
+	closeOnce sync.Once
 }
 
 func idleReader(rc io.ReadCloser, timeout time.Duration) io.ReadCloser {
@@ -776,67 +846,21 @@ func idleReader(rc io.ReadCloser, timeout time.Duration) io.ReadCloser {
 }
 
 func (i *idleReadCloser) Read(p []byte) (int, error) {
-	timer := time.AfterFunc(i.timeout, func() {
-		// Closing the body unblocks Read with an error. Idempotent on
-		// http.Response.Body (subsequent Closes are no-ops).
-		_ = i.rc.Close()
-	})
+	timer := time.AfterFunc(i.timeout, i.closeIdempotent)
 	n, err := i.rc.Read(p)
 	timer.Stop()
 	return n, err
 }
 
-func (i *idleReadCloser) Close() error { return i.rc.Close() }
-
-// indexByteASCIICaseInsensitive returns the index of the first
-// occurrence of c in s (ASCII), or -1. Case-insensitive in spirit
-// but c is treated as exact — the helper exists for ';' lookup in
-// Content-Type headers, where the separator is unambiguous.
-func indexByteASCIICaseInsensitive(s string, c byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
+func (i *idleReadCloser) Close() error {
+	i.closeIdempotent()
+	return nil
 }
 
-// trimASCIISpace strips leading and trailing ASCII whitespace.
-// Avoids the strings package's locale-aware Unicode trim because
-// HTTP header tokens are ASCII-only.
-func trimASCIISpace(s string) string {
-	start := 0
-	for start < len(s) && (s[start] == ' ' || s[start] == '\t') {
-		start++
-	}
-	end := len(s)
-	for end > start && (s[end-1] == ' ' || s[end-1] == '\t') {
-		end--
-	}
-	return s[start:end]
+func (i *idleReadCloser) closeIdempotent() {
+	i.closeOnce.Do(func() { _ = i.rc.Close() })
 }
 
-// equalASCIIFold reports whether s and t are equal under ASCII case
-// folding. Used for Content-Type comparison without pulling in a
-// Unicode-aware comparator.
-func equalASCIIFold(s, t string) bool {
-	if len(s) != len(t) {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		a, b := s[i], t[i]
-		if a >= 'A' && a <= 'Z' {
-			a += 'a' - 'A'
-		}
-		if b >= 'A' && b <= 'Z' {
-			b += 'a' - 'A'
-		}
-		if a != b {
-			return false
-		}
-	}
-	return true
-}
 
 // enableKeepalive turns on TCP keepalive with a 30s probe interval on
 // the underlying *net.TCPConn, if conn unwraps to one. No-op on other

@@ -192,20 +192,25 @@ type Finisher interface {
 //     the duration of the call. Plugins that need to retain bytes
 //     must copy.
 //   - A non-Continue Action returned mid-stream stops further
-//     dispatch for that frame and rejects the response. The current
-//     forwardproxy/reverseproxy implementations forward+flush before
-//     calling OnResponseFrame for record-only observability, so a
-//     mid-stream Reject from a plugin would not un-send already-sent
-//     bytes; today no plugin returns Reject from this hook. The hook
+//     dispatch for that frame and rejects the response. Listener
+//     ordering varies: forwardproxy invokes OnResponseFrame before
+//     emitting frame bytes, while reverseproxy emits frame bytes
+//     first (FlushInterval=-1 ferries each Read straight to the
+//     client) and then dispatches. Either way previously-emitted
+//     frames cannot be un-sent, so a mid-stream Reject results in
+//     a truncated stream rather than a 4xx/5xx response. Today no
+//     in-tree plugin returns Reject from this hook; the contract
 //     leaves the door open for per-message enforcement to be added
-//     later (the listener would have to inspect-before-forward at
-//     that point).
+//     later (a listener doing enforcement would inspect-before-forward
+//     at that point).
 //   - last=true is always called exactly once at end-of-stream, even
 //     for an empty/zero-frame stream. Plugins finalize on last=true.
 //   - For application/json responses the listener calls
-//     OnResponseFrame once with the full body and last=true; OnResponse
-//     is then NOT called for plugins that implement this interface
-//     (the framework picks one path).
+//     OnResponseFrame once with the full body and last=true.
+//     pipeline.RunResponse skips plugins implementing this interface
+//     so OnResponse is not called for them — the framework picks one
+//     path so a single response body is never delivered through both
+//     hooks.
 type StreamingResponder interface {
 	OnResponseFrame(ctx context.Context, pctx *Context, frame []byte, last bool) Action
 }

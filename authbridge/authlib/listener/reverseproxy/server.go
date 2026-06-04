@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/kagenti/kagenti-extensions/authbridge/authlib/listener/httpx"
@@ -601,11 +602,28 @@ func (b *streamingResponseBody) Read(p []byte) (int, error) {
 		return 0, fmt.Errorf("reverseproxy: streaming response rejected mid-stream")
 	}
 
-	// Re-frame as SSE: "data: <payload>\n\n".
+	// Re-frame as SSE. The decoder folds multi-line `data:` events
+	// with `\n` separators per spec; split here so each original line
+	// gets its own `data: ` prefix and the downstream parser sees the
+	// same event boundaries the upstream produced. For single-line
+	// JSON-RPC payloads this is equivalent to one `data: <payload>\n\n`.
 	out := make([]byte, 0, len(frame)+8)
-	out = append(out, "data: "...)
-	out = append(out, frame...)
-	out = append(out, "\n\n"...)
+	rest := frame
+	for len(rest) > 0 {
+		nl := bytes.IndexByte(rest, '\n')
+		var line []byte
+		if nl < 0 {
+			line = rest
+			rest = nil
+		} else {
+			line = rest[:nl]
+			rest = rest[nl+1:]
+		}
+		out = append(out, "data: "...)
+		out = append(out, line...)
+		out = append(out, '\n')
+	}
+	out = append(out, '\n')
 
 	n := copy(p, out)
 	if n < len(out) {
@@ -638,51 +656,10 @@ func isEventStream(contentType string) bool {
 	if contentType == "" {
 		return false
 	}
-	if idx := indexByteASCII(contentType, ';'); idx >= 0 {
+	if idx := strings.IndexByte(contentType, ';'); idx >= 0 {
 		contentType = contentType[:idx]
 	}
-	contentType = trimASCIISpace(contentType)
-	return equalASCIIFold(contentType, "text/event-stream")
-}
-
-func indexByteASCII(s string, c byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
-}
-
-func trimASCIISpace(s string) string {
-	start := 0
-	for start < len(s) && (s[start] == ' ' || s[start] == '\t') {
-		start++
-	}
-	end := len(s)
-	for end > start && (s[end-1] == ' ' || s[end-1] == '\t') {
-		end--
-	}
-	return s[start:end]
-}
-
-func equalASCIIFold(s, t string) bool {
-	if len(s) != len(t) {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		a, b := s[i], t[i]
-		if a >= 'A' && a <= 'Z' {
-			a += 'a' - 'A'
-		}
-		if b >= 'A' && b <= 'Z' {
-			b += 'a' - 'A'
-		}
-		if a != b {
-			return false
-		}
-	}
-	return true
+	return strings.EqualFold(strings.TrimSpace(contentType), "text/event-stream")
 }
 
 // inboundSessionID returns the bucket ID for an inbound event. Mirrors

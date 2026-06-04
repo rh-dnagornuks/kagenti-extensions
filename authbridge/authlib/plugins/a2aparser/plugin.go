@@ -104,11 +104,13 @@ func (p *A2AParser) OnRequest(_ context.Context, pctx *pipeline.Context) pipelin
 	return pipeline.Action{Type: pipeline.Continue}
 }
 
-// OnResponse extracts the server-assigned session/context ID and response summary
-// from a buffered response body. Streaming-aware listeners take the
-// OnResponseFrame path instead and this method becomes a no-op when
-// the streaming path has already populated the extension's response
-// fields.
+// OnResponse is the legacy buffered-path response hook. Because this
+// plugin implements StreamingResponder, pipeline.RunResponse skips it
+// and OnResponseFrame is the dispatch path under all listeners — this
+// method is unreachable from a normal listener. Kept for tests and
+// hypothetical pipelines that call OnResponse directly without going
+// through RunResponse, with a defensive guard against re-recording if
+// the streaming path has already populated state.
 func (p *A2AParser) OnResponse(_ context.Context, pctx *pipeline.Context) pipeline.Action {
 	if pctx.Extensions.A2A == nil {
 		return pipeline.Action{Type: pipeline.Continue}
@@ -189,6 +191,30 @@ func (p *A2AParser) OnResponseFrame(_ context.Context, pctx *pipeline.Context, f
 // logA2AFinalized emits the operator-facing debug log once a response
 // is finalized — shared by OnResponse and OnResponseFrame so the two
 // paths log identically.
+// maxArtifactBytes caps the accumulated A2A artifact text recorded
+// for observability. Long agent runs can stream many artifact-update
+// events; without a cap, ext.Artifact would grow unbounded across
+// frames and live on the response event for the life of the request.
+// 64 KiB keeps the most recent text usable in abctl while bounding
+// per-request memory.
+const maxArtifactBytes = 64 * 1024
+
+// appendCapped appends s to dst up to maxArtifactBytes; once the cap
+// is reached, further appends are silently dropped (a single
+// "…(truncated)" suffix is added the first time we hit the cap so the
+// timeline shows truncation explicitly).
+func appendCapped(dst, s string) string {
+	const truncMarker = "…(truncated)"
+	if len(dst) >= maxArtifactBytes {
+		return dst
+	}
+	remaining := maxArtifactBytes - len(dst)
+	if len(s) <= remaining {
+		return dst + s
+	}
+	return dst + s[:remaining] + truncMarker
+}
+
 func logA2AFinalized(ext *pipeline.A2AExtension) {
 	slog.Debug("a2a-parser: response parsed",
 		"sessionId", ext.SessionID,
@@ -331,7 +357,7 @@ func extractStreamEvent(data []byte, ext *pipeline.A2AExtension) {
 	case "artifact-update", "artifact":
 		for _, part := range event.Result.Artifact.Parts {
 			if part.Kind == "text" && part.Text != "" {
-				ext.Artifact += part.Text
+				ext.Artifact = appendCapped(ext.Artifact, part.Text)
 			}
 		}
 	}

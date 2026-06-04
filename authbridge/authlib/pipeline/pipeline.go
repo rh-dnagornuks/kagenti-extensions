@@ -133,6 +133,13 @@ func (p *Pipeline) Run(ctx context.Context, pctx *Context) Action {
 // RunResponse executes the response phase in reverse order.
 // The last plugin in the chain sees the response first.
 //
+// Plugins implementing StreamingResponder are skipped here — the
+// framework picks one path per the StreamingResponder contract:
+// streaming-aware plugins receive a final OnResponseFrame(last=true)
+// from the listener (single dispatch on the buffered application/json
+// path; per-frame + last=true on the SSE path) instead of OnResponse,
+// so the same body is never delivered through both hooks.
+//
 // See Run for the pctx attribution stamping, the off-policy skip, and
 // the observe-policy shadow conversion. Same pattern, phase set to
 // InvocationPhaseResponse.
@@ -140,6 +147,9 @@ func (p *Pipeline) RunResponse(ctx context.Context, pctx *Context) Action {
 	for i := len(p.plugins) - 1; i >= 0; i-- {
 		policy := p.policyAt(i)
 		if policy == ErrorPolicyOff {
+			continue
+		}
+		if _, ok := p.plugins[i].(StreamingResponder); ok {
 			continue
 		}
 		if ctx.Err() != nil {

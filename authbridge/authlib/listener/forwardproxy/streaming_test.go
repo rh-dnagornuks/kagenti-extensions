@@ -20,12 +20,16 @@ import (
 // observe how the proxy dispatches frames. It records every frame
 // it sees along with the last flag, so tests can assert on order
 // and finalization. ReadsBody=true so the listener takes the
-// NeedsBody path on requests.
+// NeedsBody path on requests. OnResponse calls are also counted so
+// tests can verify the framework's "pick one path" contract for
+// StreamingResponder plugins (OnResponse must NOT be called when
+// OnResponseFrame is the dispatch path).
 type streamingProbe struct {
-	mu     sync.Mutex
-	frames [][]byte
-	lasts  []bool
-	caps   pipeline.PluginCapabilities
+	mu              sync.Mutex
+	frames          [][]byte
+	lasts           []bool
+	onResponseCalls int
+	caps            pipeline.PluginCapabilities
 }
 
 func newStreamingProbe(writesBody bool) *streamingProbe {
@@ -43,6 +47,9 @@ func (p *streamingProbe) OnRequest(_ context.Context, _ *pipeline.Context) pipel
 	return pipeline.Action{Type: pipeline.Continue}
 }
 func (p *streamingProbe) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
+	p.mu.Lock()
+	p.onResponseCalls++
+	p.mu.Unlock()
 	return pipeline.Action{Type: pipeline.Continue}
 }
 func (p *streamingProbe) OnResponseFrame(_ context.Context, _ *pipeline.Context, frame []byte, last bool) pipeline.Action {
@@ -63,6 +70,12 @@ func (p *streamingProbe) snapshot() ([][]byte, []bool) {
 	lasts := make([]bool, len(p.lasts))
 	copy(lasts, p.lasts)
 	return frames, lasts
+}
+
+func (p *streamingProbe) onResponseCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.onResponseCalls
 }
 
 // TestForwardProxy_Streaming_FramesFlowThrough asserts that an upstream
@@ -239,6 +252,13 @@ func TestForwardProxy_BufferedDeliversLastTrueFrame(t *testing.T) {
 	}
 	if !bytes.Equal(frames[0], []byte(`{"ok":true}`)) {
 		t.Errorf("frame[0] = %q, want JSON body", frames[0])
+	}
+	// Regression: a StreamingResponder plugin must NOT have OnResponse
+	// called on the buffered application/json path — the framework
+	// picks one path and the buffered last=true frame is it. Otherwise
+	// migrated plugins would record every JSON response twice.
+	if got := probe.onResponseCount(); got != 0 {
+		t.Errorf("OnResponse called %d times; want 0 (StreamingResponder picks the OnResponseFrame path)", got)
 	}
 }
 

@@ -145,44 +145,42 @@ func (r *Reader) ReadFrame() ([]byte, error) {
 	}
 }
 
-// readLine reads one logical SSE line (terminated by LF, CR, or CRLF)
-// off the underlying buffered reader. The returned slice excludes the
+// readLine reads one logical SSE line off the underlying buffered
+// reader. Line terminators per the SSE spec are LF, CR, or CRLF —
+// any of the three ends a line. The returned slice excludes the
 // terminator and is valid only until the next call. EOF without a
 // final newline is reported as io.EOF only when the line is empty;
 // otherwise the unterminated tail is returned.
+//
+// Per-line bytes are bounded by r.maxSize so a pathological non-data
+// line (huge comment, malformed unknown field) cannot grow memory
+// past the per-frame cap.
 func (r *Reader) readLine() ([]byte, error) {
 	var line []byte
 	for {
-		// Read up to and including the next LF. If the underlying
-		// reader returns an io.EOF with no data, propagate it; with
-		// data, treat the final unterminated chunk as a line.
-		chunk, err := r.br.ReadSlice('\n')
-		if len(chunk) > 0 {
-			line = append(line, chunk...)
-			if chunk[len(chunk)-1] == '\n' {
-				// Terminated. Strip CRLF or LF.
-				line = line[:len(line)-1]
-				if len(line) > 0 && line[len(line)-1] == '\r' {
-					line = line[:len(line)-1]
-				}
-				return line, nil
-			}
-			// ReadSlice returned a buffer-full chunk without LF; loop
-			// to keep accumulating into `line`. This handles SSE
-			// data lines longer than bufio's buffer.
-			if err == bufio.ErrBufferFull {
-				continue
-			}
-		}
+		b, err := r.br.ReadByte()
 		if err != nil {
 			if err == io.EOF && len(line) > 0 {
-				// Strip a possible trailing CR (no LF was seen).
-				if line[len(line)-1] == '\r' {
-					line = line[:len(line)-1]
-				}
 				return line, nil
 			}
 			return nil, err
+		}
+		switch b {
+		case '\n':
+			return line, nil
+		case '\r':
+			// Coalesce CRLF as a single terminator. If the next byte
+			// isn't LF, leave it for the next ReadByte; a bare CR is
+			// itself a valid line terminator.
+			if next, perr := r.br.Peek(1); perr == nil && len(next) == 1 && next[0] == '\n' {
+				_, _ = r.br.ReadByte()
+			}
+			return line, nil
+		default:
+			if len(line)+1 > r.maxSize {
+				return nil, ErrFrameTooLarge
+			}
+			line = append(line, b)
 		}
 	}
 }

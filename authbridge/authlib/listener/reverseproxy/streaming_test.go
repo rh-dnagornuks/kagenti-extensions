@@ -17,12 +17,15 @@ import (
 
 // streamingProbe is a Plugin + StreamingResponder for asserting on
 // what the reverseproxy dispatches. ReadsBody=true so the listener
-// takes the NeedsBody buffering path on requests.
+// takes the NeedsBody buffering path on requests. OnResponse calls
+// are counted so tests can verify the framework's "pick one path"
+// contract for StreamingResponder plugins.
 type streamingProbe struct {
-	mu     sync.Mutex
-	frames [][]byte
-	lasts  []bool
-	caps   pipeline.PluginCapabilities
+	mu              sync.Mutex
+	frames          [][]byte
+	lasts           []bool
+	onResponseCalls int
+	caps            pipeline.PluginCapabilities
 }
 
 func newStreamingProbe(writesBody bool) *streamingProbe {
@@ -37,6 +40,9 @@ func (p *streamingProbe) OnRequest(_ context.Context, _ *pipeline.Context) pipel
 	return pipeline.Action{Type: pipeline.Continue}
 }
 func (p *streamingProbe) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
+	p.mu.Lock()
+	p.onResponseCalls++
+	p.mu.Unlock()
 	return pipeline.Action{Type: pipeline.Continue}
 }
 func (p *streamingProbe) OnResponseFrame(_ context.Context, _ *pipeline.Context, frame []byte, last bool) pipeline.Action {
@@ -57,6 +63,12 @@ func (p *streamingProbe) snapshot() ([][]byte, []bool) {
 	lasts := make([]bool, len(p.lasts))
 	copy(lasts, p.lasts)
 	return frames, lasts
+}
+
+func (p *streamingProbe) onResponseCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.onResponseCalls
 }
 
 // TestReverseProxy_Streaming_FramesFlowThrough asserts the inbound
@@ -204,6 +216,12 @@ func TestReverseProxy_BufferedDeliversLastTrueFrame(t *testing.T) {
 	frames, lasts := probe.snapshot()
 	if len(frames) != 1 || !lasts[0] {
 		t.Fatalf("frames=%v lasts=%v; want single last=true call", framesAsStrings(frames), lasts)
+	}
+	// Regression: a StreamingResponder plugin must NOT have OnResponse
+	// called on the buffered application/json path — the framework
+	// picks one path so the same body isn't recorded twice.
+	if got := probe.onResponseCount(); got != 0 {
+		t.Errorf("OnResponse called %d times; want 0 (StreamingResponder picks the OnResponseFrame path)", got)
 	}
 }
 
