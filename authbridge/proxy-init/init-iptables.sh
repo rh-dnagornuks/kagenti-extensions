@@ -128,18 +128,29 @@ set -e
 
 # --- Mode selection ---
 # MODE selects the interception strategy:
-#   redirect      (default) — envoy-sidecar: transparently REDIRECT pod traffic
-#                 to the Envoy listeners (the behavior documented above).
-#   enforce-drop  — proxy-sidecar: a fail-closed egress guard. The app is
-#                 configured with HTTP_PROXY pointing at AuthBridge's forward
-#                 proxy; this mode DROPs any egress that bypasses the proxy,
-#                 forcing all external traffic through AuthBridge regardless of
-#                 whether the app honors HTTP_PROXY. It installs no REDIRECT and
-#                 no PREROUTING/inbound rules. See setup_enforce_drop() below.
+#   redirect          (default) — envoy-sidecar: transparently REDIRECT pod
+#                     traffic to the Envoy listeners (the behavior documented
+#                     above).
+#   enforce-redirect  — proxy-sidecar: a fail-closed egress guard that CAPTURES
+#                     rather than drops. External TCP egress that bypasses the
+#                     forward proxy is transparently REDIRECTed to AuthBridge's
+#                     transparent listener (TRANSPARENT_PORT), which recovers the
+#                     original destination via SO_ORIGINAL_DST and tunnels it
+#                     through the same outbound pipeline. Non-TCP external egress
+#                     (UDP/QUIC) is DROPped so it cannot bypass via HTTP/3.
+#                     In-cluster + loopback + proxy-UID traffic is left direct.
+#                     Nothing breaks for agents that ignore HTTP_PROXY — their
+#                     traffic is captured, not dropped. See setup_enforce_redirect().
+#   enforce-drop      — proxy-sidecar: a fail-closed egress guard that DROPs any
+#                     egress bypassing the proxy. Predates enforce-redirect;
+#                     retained for the no-transparent-listener fallback. The app
+#                     is configured with HTTP_PROXY pointing at AuthBridge's
+#                     forward proxy. Installs no REDIRECT and no inbound rules.
+#                     See setup_enforce_drop() below.
 MODE="${MODE:-redirect}"
 case "${MODE}" in
-  redirect|enforce-drop) ;;
-  *) echo "ERROR: unknown MODE='${MODE}' (expected: redirect | enforce-drop)" >&2; exit 1 ;;
+  redirect|enforce-redirect|enforce-drop) ;;
+  *) echo "ERROR: unknown MODE='${MODE}' (expected: redirect | enforce-redirect | enforce-drop)" >&2; exit 1 ;;
 esac
 
 # --- Auto-detect iptables backend ---
@@ -164,6 +175,10 @@ echo "Using iptables command: ${IPT} ($(${IPT} --version 2>/dev/null || echo 'un
 
 PROXY_PORT="${PROXY_PORT:-15123}"
 INBOUND_PROXY_PORT="${INBOUND_PROXY_PORT:-15124}"
+# enforce-redirect mode: the forward proxy's transparent listener port, the
+# REDIRECT target for captured external TCP egress. Must match the authbridge
+# proxy-sidecar listener.transparent_proxy_addr (default :8082).
+TRANSPARENT_PORT="${TRANSPARENT_PORT:-8082}"
 PROXY_UID="${PROXY_UID:-1337}"
 SSH_PORT="${SSH_PORT:-22}"
 OUTBOUND_PORTS_EXCLUDE="${OUTBOUND_PORTS_EXCLUDE:-}"
@@ -291,8 +306,100 @@ setup_enforce_drop() {
   echo "enforce-drop: fail-closed egress guard active"
 }
 
-# Dispatch enforce-drop here and exit; redirect mode falls through to the
+# =============================================================================
+# enforce-redirect mode (proxy-sidecar fail-closed egress guard, capture variant)
+# =============================================================================
+#
+# Same intent as enforce-drop — force all external egress through AuthBridge
+# regardless of whether the app honors HTTP_PROXY — but instead of DROPping
+# bypass traffic, it CAPTURES it: external TCP is transparently REDIRECTed to
+# the forward proxy's transparent listener (TRANSPARENT_PORT), which recovers
+# the original destination via SO_ORIGINAL_DST and tunnels it through the same
+# outbound pipeline. Because nothing is dropped, agents that ignore HTTP_PROXY
+# keep working — this is what lets enforcement be always-on.
+#
+# Placement — a dedicated chain hooked from *nat* OUTPUT at position 1 (REDIRECT
+# is a nat-table target). Inserted before Istio's appended ISTIO_OUTPUT so we
+# preempt ambient's nat redirect for external destinations, exactly as
+# redirect mode does for the Envoy path.
+#
+# Rule order: RETURN ztunnel's own sockets (fwmark 0x539, no-op without ambient)
+# -> RETURN the proxy's own re-originated egress (PROXY_UID, avoids the loop) ->
+# RETURN loopback (app -> forward proxy via HTTP_PROXY, and any loopback) ->
+# RETURN in-cluster CIDRs (mesh/DNS, left direct) -> REDIRECT external TCP to
+# TRANSPARENT_PORT -> DROP all other external egress (UDP/QUIC, so HTTP/3 can't
+# bypass; well-behaved clients fall back to TCP and get captured).
+#
+# Unlike enforce-drop there is no conntrack ESTABLISHED rule: nat only evaluates
+# the first packet of a flow, so replies and established connections are not
+# re-translated.
+setup_enforce_redirect() {
+  CHAIN="AB_REDIRECT"
+
+  echo "enforce-redirect: installing fail-closed egress capture (nat OUTPUT, chain ${CHAIN})"
+  echo "enforce-redirect: external TCP -> 127.0.0.1:${TRANSPARENT_PORT}; exempt proxy UID=${PROXY_UID}; direct in-cluster CIDRs=${CLUSTER_CIDRS}"
+
+  # --- IPv4 ---
+  ${IPT} -t nat -N "${CHAIN}" 2>/dev/null || true
+  ${IPT} -t nat -F "${CHAIN}"
+  # ztunnel's own sockets (ambient) carry fwmark 0x539 — let them through.
+  ${IPT} -t nat -A "${CHAIN}" -m mark --mark "${ZTUNNEL_MARK}" -j RETURN
+  # the AuthBridge proxy's own re-originated egress (runs as PROXY_UID) — avoids
+  # redirecting the proxy's upstream dial back into itself.
+  ${IPT} -t nat -A "${CHAIN}" -m owner --uid-owner "${PROXY_UID}" -j RETURN
+  # app -> forward proxy over loopback (HTTP_PROXY target), and any loopback.
+  ${IPT} -t nat -A "${CHAIN}" -o lo -j RETURN
+  ${IPT} -t nat -A "${CHAIN}" -d 127.0.0.0/8 -j RETURN
+  # in-cluster traffic (pods / services / DNS) — left direct, carried by the mesh.
+  for cidr in $(echo "${CLUSTER_CIDRS}" | tr ',' ' '); do
+    [ -n "${cidr}" ] && ${IPT} -t nat -A "${CHAIN}" -d "${cidr}" -j RETURN
+  done
+  # external TCP that bypassed the forward proxy — capture it transparently.
+  ${IPT} -t nat -A "${CHAIN}" -p tcp -j REDIRECT --to-port "${TRANSPARENT_PORT}"
+  # external non-TCP (UDP/QUIC) — cannot be redirected to a TCP listener; drop so
+  # HTTP/3 cannot bypass. Clients fall back to TCP, which the rule above captures.
+  ${IPT} -t nat -A "${CHAIN}" -j DROP
+  # Hook at position 1 so we run before any appended Istio nat chain.
+  if ! ${IPT} -t nat -C OUTPUT -j "${CHAIN}" 2>/dev/null; then
+    ${IPT} -t nat -I OUTPUT 1 -j "${CHAIN}"
+  fi
+  echo "enforce-redirect: IPv4 egress capture configured"
+
+  # --- IPv6 ---
+  # Mirror of IPv4. Until v6 cluster CIDRs are wired (CLUSTER_CIDRS6), allow
+  # loopback + link-local (fe80::/10 unicast, ff02::/16 NDP/MLD multicast) and
+  # the proxy UID / ztunnel mark; REDIRECT external v6 TCP; DROP other v6 egress.
+  if command -v "${IP6T%% *}" >/dev/null 2>&1 && ${IP6T} -t nat -L >/dev/null 2>&1; then
+    ${IP6T} -t nat -N "${CHAIN}" 2>/dev/null || true
+    ${IP6T} -t nat -F "${CHAIN}"
+    ${IP6T} -t nat -A "${CHAIN}" -m mark --mark "${ZTUNNEL_MARK}" -j RETURN
+    ${IP6T} -t nat -A "${CHAIN}" -m owner --uid-owner "${PROXY_UID}" -j RETURN
+    ${IP6T} -t nat -A "${CHAIN}" -o lo -j RETURN
+    ${IP6T} -t nat -A "${CHAIN}" -d ::1/128 -j RETURN
+    ${IP6T} -t nat -A "${CHAIN}" -d fe80::/10 -j RETURN
+    ${IP6T} -t nat -A "${CHAIN}" -d ff02::/16 -j RETURN
+    for cidr in $(echo "${CLUSTER_CIDRS6}" | tr ',' ' '); do
+      [ -n "${cidr}" ] && ${IP6T} -t nat -A "${CHAIN}" -d "${cidr}" -j RETURN
+    done
+    ${IP6T} -t nat -A "${CHAIN}" -p tcp -j REDIRECT --to-port "${TRANSPARENT_PORT}"
+    ${IP6T} -t nat -A "${CHAIN}" -j DROP
+    if ! ${IP6T} -t nat -C OUTPUT -j "${CHAIN}" 2>/dev/null; then
+      ${IP6T} -t nat -I OUTPUT 1 -j "${CHAIN}"
+    fi
+    echo "enforce-redirect: IPv6 egress capture configured"
+  else
+    echo "enforce-redirect: ip6tables unavailable — skipping IPv6 egress capture"
+  fi
+
+  echo "enforce-redirect: fail-closed egress capture active"
+}
+
+# Dispatch enforce-* modes here and exit; redirect mode falls through to the
 # transparent-interception logic below.
+if [ "${MODE}" = "enforce-redirect" ]; then
+  setup_enforce_redirect
+  exit 0
+fi
 if [ "${MODE}" = "enforce-drop" ]; then
   setup_enforce_drop
   exit 0

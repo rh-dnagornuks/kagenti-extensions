@@ -2,13 +2,14 @@
 
 The `proxy-init` container programs iptables rules for an
 AuthBridge-injected pod. It runs once at pod startup as a Kubernetes
-init container, then exits. It has two modes, selected by the `MODE`
+init container, then exits. It has three modes, selected by the `MODE`
 env var:
 
 | `MODE` | Used by | What it does |
 |---|---|---|
 | `redirect` (default) | `envoy-sidecar` | Transparently **REDIRECT**s pod traffic to the Envoy listeners. |
-| `enforce-drop` | `proxy-sidecar` | Fail-closed egress guard — **DROP**s any egress that bypasses the forward proxy. |
+| `enforce-redirect` | `proxy-sidecar` | Fail-closed egress guard that **captures**: REDIRECTs external TCP that bypasses the forward proxy to AuthBridge's transparent listener; DROPs non-TCP external egress. |
+| `enforce-drop` | `proxy-sidecar` | Fail-closed egress guard that **DROP**s any egress that bypasses the forward proxy. Predates `enforce-redirect`; retained as a no-transparent-listener fallback. |
 
 ## `redirect` mode (envoy-sidecar)
 
@@ -27,6 +28,45 @@ env var:
 - **Configurable exclusions** — Honors `OUTBOUND_PORTS_EXCLUDE` and
   `INBOUND_PORTS_EXCLUDE` env vars (commonly used to exclude
   Keycloak's port 8080 to avoid token-exchange loops).
+
+## `enforce-redirect` mode (proxy-sidecar)
+
+In `proxy-sidecar` mode the workload is configured with `HTTP_PROXY`
+pointing at AuthBridge's forward proxy. On its own that is purely
+cooperative — an app that ignores `HTTP_PROXY` (or sets `NO_PROXY`)
+egresses directly and bypasses AuthBridge. `enforce-redirect` closes
+that gap **by capturing** the bypass traffic instead of dropping it:
+external TCP that did not go through the forward proxy is transparently
+REDIRECTed to AuthBridge's **transparent listener** (`TRANSPARENT_PORT`,
+default 8082), which recovers the original destination via
+`SO_ORIGINAL_DST` and tunnels it through the same outbound pipeline.
+Because nothing is dropped, agents that ignore `HTTP_PROXY` keep working
+— which is what lets enforcement be always-on.
+
+`init-iptables.sh` builds a dedicated `AB_REDIRECT` chain hooked from
+**`nat` OUTPUT at position 1** (REDIRECT is a nat-table target), with
+this order:
+
+1. `RETURN` ztunnel's own sockets (fwmark `0x539`) — no-op without ambient.
+2. `RETURN` the proxy's own re-originated egress (`--uid-owner $PROXY_UID`, default 1337) — avoids the redirect loop.
+3. `RETURN` loopback (the app → forward proxy hop) and in-cluster CIDRs (`CLUSTER_CIDRS`, mesh/DNS) — left direct.
+4. `REDIRECT` external **TCP** to `TRANSPARENT_PORT` — captured.
+5. `DROP` everything else — external **non-TCP** (UDP/QUIC), so HTTP/3 cannot bypass; well-behaved clients fall back to TCP and get captured.
+
+An IPv6 mirror applies the same exemptions, REDIRECTs external v6 TCP,
+and drops other v6 egress. There is no conntrack `ESTABLISHED` rule —
+nat only evaluates the first packet of a flow, so replies and
+established connections are not re-translated.
+
+`enforce-redirect` is inserted at `nat OUTPUT` position 1, ahead of
+Istio's appended (`-A`) `ISTIO_OUTPUT` chain, so it preempts ambient's
+nat redirect for external destinations — exactly as `redirect` mode does
+for the Envoy path. See
+[`test-enforce-redirect.sh`](./test-enforce-redirect.sh), which proves
+both the capture and the preemption via packet counters.
+
+`CLUSTER_CIDRS` has the same Kind-shaped default and OCP/EKS override
+requirement as documented under `enforce-drop` below.
 
 ## `enforce-drop` mode (proxy-sidecar)
 
@@ -88,17 +128,18 @@ whichever the host kernel exposes. Override with `IPTABLES_CMD` (and
 
 | Variable | Default | Mode | Purpose |
 |---|---|---|---|
-| `MODE` | `redirect` | both | `redirect` (envoy-sidecar) or `enforce-drop` (proxy-sidecar) |
-| `PROXY_UID` | `1337` | both | UID of the AuthBridge sidecar process; exempted from redirect / drop |
+| `MODE` | `redirect` | all | `redirect` (envoy-sidecar), `enforce-redirect` or `enforce-drop` (proxy-sidecar) |
+| `PROXY_UID` | `1337` | all | UID of the AuthBridge sidecar process; exempted from redirect / drop |
 | `PROXY_PORT` | `15123` | redirect | AuthBridge outbound listener port |
 | `INBOUND_PROXY_PORT` | `15124` | redirect | AuthBridge inbound listener port |
+| `TRANSPARENT_PORT` | `8082` | enforce-redirect | AuthBridge transparent listener port; REDIRECT target for captured external TCP egress |
 | `OUTBOUND_PORTS_EXCLUDE` | (empty) | redirect | Comma-separated outbound port list to skip (e.g. `8080`) |
 | `INBOUND_PORTS_EXCLUDE` | (empty) | redirect | Comma-separated inbound port list to skip |
-| `POD_IP` | (required in `redirect`) | redirect | Set via Downward API; DNAT target for ambient-mesh inbound. Not used by `enforce-drop`. |
-| `CLUSTER_CIDRS` | `10.0.0.0/8` | enforce-drop | Comma-separated in-cluster CIDRs allowed direct (pods/services/DNS) |
-| `CLUSTER_CIDRS6` | (empty) | enforce-drop | IPv6 in-cluster CIDRs (dual-stack); empty drops all external v6 egress |
-| `IPTABLES_CMD` | auto-detected | both | Override iptables binary (`iptables-legacy` / `iptables-nft`) |
-| `IP6TABLES_CMD` | derived from `IPTABLES_CMD` | enforce-drop | Override ip6tables binary |
+| `POD_IP` | (required in `redirect`) | redirect | Set via Downward API; DNAT target for ambient-mesh inbound. Not used by `enforce-*`. |
+| `CLUSTER_CIDRS` | `10.0.0.0/8` | enforce-redirect, enforce-drop | Comma-separated in-cluster CIDRs allowed direct (pods/services/DNS) |
+| `CLUSTER_CIDRS6` | (empty) | enforce-redirect, enforce-drop | IPv6 in-cluster CIDRs (dual-stack); empty drops all external v6 egress |
+| `IPTABLES_CMD` | auto-detected | all | Override iptables binary (`iptables-legacy` / `iptables-nft`) |
+| `IP6TABLES_CMD` | derived from `IPTABLES_CMD` | enforce-redirect, enforce-drop | Override ip6tables binary |
 
 ## Required Kubernetes capabilities
 
@@ -120,13 +161,18 @@ in [`.github/workflows/build.yaml`](../../.github/workflows/build.yaml)).
 
 ## Testing
 
-[`test-enforce-drop.sh`](./test-enforce-drop.sh) validates `enforce-drop`
-mode in a private network namespace (`unshare --net`): it asserts the
-`AB_EGRESS` rule structure and proves the `mangle` DROP preempts a
-simulated Istio ambient `nat OUTPUT` REDIRECT via packet counters.
-Requires root + iptables-nft on Linux (runs on CI; not macOS):
+[`test-enforce-redirect.sh`](./test-enforce-redirect.sh) validates
+`enforce-redirect` mode in a private network namespace (`unshare --net`):
+it asserts the `AB_REDIRECT` rule structure, proves external TCP is
+captured to `TRANSPARENT_PORT` while preempting a simulated Istio ambient
+`nat OUTPUT` REDIRECT, and proves external UDP is dropped — all via packet
+counters. [`test-enforce-drop.sh`](./test-enforce-drop.sh) does the same
+for `enforce-drop` (asserts `AB_EGRESS` structure and the `mangle` DROP
+preemption). Both require root + iptables-nft on Linux (run on CI; not
+macOS):
 
 ```sh
+sudo ./test-enforce-redirect.sh
 sudo ./test-enforce-drop.sh
 ```
 
@@ -137,10 +183,13 @@ container automatically:
 
 - `redirect` mode (`MODE` unset) when the resolved AuthBridge mode is
   `envoy-sidecar`.
-- `enforce-drop` mode (`MODE=enforce-drop`) when `proxy-sidecar`
-  egress enforcement is enabled (opt-in). _The operator wiring that
-  sets this lands in the follow-up kagenti-operator PR; this PR only
-  adds the mode to the image._
+- `enforce-redirect` mode (`MODE=enforce-redirect`) when the resolved
+  AuthBridge mode is `proxy-sidecar` / `lite` — the transparent listener
+  in those images receives the captured egress. _The operator wiring that
+  sets this lands in the companion kagenti-operator PR; this PR adds the
+  mode to the image and the transparent listener to the proxy._
+- `enforce-drop` mode (`MODE=enforce-drop`) — the drop-based fallback,
+  retained for environments without the transparent listener.
 
 See
 [`authbridge/demos/weather-agent/demo-ui-advanced.md`](../demos/weather-agent/demo-ui-advanced.md)
