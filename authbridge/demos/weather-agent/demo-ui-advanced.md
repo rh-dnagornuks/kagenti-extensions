@@ -183,11 +183,11 @@ python demos/weather-agent/setup_keycloak_weather_advanced.py -n team1
 
 > **Expected catalog quirk.** The **Agent Catalog** shows **two** entries:
 > `weather-service-advanced` *and* `weather-tool-advanced`. The **Tool
-> Catalog** is empty. This is by design — the advanced demo labels the
-> tool with `kagenti.io/type: agent` so AuthBridge gets injected on it
-> (the `injectTools` feature gate is off by default; see the
-> [kubectl appendix](#operator-gotchas)). Pick `weather-service-advanced`
-> for chat.
+> Catalog** is empty. This is by design — the tool's AgentRuntime CR
+> uses `type: agent` so the operator applies `kagenti.io/type=agent`
+> and AuthBridge gets injected (the `injectTools` feature gate is off
+> by default; see the [kubectl appendix](#operator-gotchas)). Pick
+> `weather-service-advanced` for chat.
 
 1. **Agent Catalog** → namespace `team1` → `weather-service-advanced` →
    **View Details**. The agent card should render (proves the agent is up and
